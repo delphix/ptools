@@ -1,0 +1,829 @@
+//
+//   Copyright 2018 Delphix
+//
+//   Licensed under the Apache License, Version 2.0 (the "License");
+//   you may not use this file except in compliance with the License.
+//   You may obtain a copy of the License at
+//
+//       http://www.apache.org/licenses/LICENSE-2.0
+//
+//   Unless required by applicable law or agreed to in writing, software
+//   distributed under the License is distributed on an "AS IS" BASIS,
+//   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//   See the License for the specific language governing permissions and
+//   limitations under the License.
+//
+
+// Remove jemalloc and use the system allocator instead. Jemalloc accounts for ~300K in a stripped
+// binary, and isn't useful here because we will be doing minimal allocation.
+use std::alloc::System;
+#[global_allocator]
+static ALLOCATOR: System = System;
+
+extern crate getopts;
+extern crate nix;
+extern crate regex;
+
+use getopts::{Options, ParsingStyle};
+
+use nix::fcntl::OFlag;
+use nix::sys::socket::{AddressFamily, SockType};
+use nix::sys::stat::{major, minor, stat, SFlag};
+use regex::Regex;
+use std::collections::HashMap;
+use std::env;
+use std::error::Error;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::Path;
+use std::str::from_utf8;
+
+// Issues blocking 0.1 release
+//  - Everything marked with BLOCKER
+//  - Offset into file for pfiles
+//  - Finish pfiles (handle remaining file types)
+//  - Update README with current build instructions
+//  - Add relevant package metadata
+//  - Format code using rustfmt
+
+// Issues for post 0.1 release
+// - May want to save space by removing regex crate
+// - Add a type alias for Result<Foo, Box<Error>>
+// - Add support for handling core dumps
+// - Handle unprintable characters in anything we need to print and non-UTF8 in any input
+// - Allow a user to be specified in ptree
+// - Replace top-level .unwrap()s with a nicer error message
+// - Read current environ in penv
+// - Test against 32-bit processes
+// - Test pfiles against processes with IPv6 sockets
+// - Illumos pfiles prints socket options for sockets. Is there any way to read those on Linux?
+//
+
+//
+// Error handling philosophy: in general these tools should try to recover from errors and continue
+// to produce useful output. Debugging tools, much more so than other tools, are expected to be run
+// on systems which are in unusual and bad states. Indeed, this is when they are most useful. Note
+// that this mainly refers to situations where info on the system doesn't match our expectations.
+// For instance, if we expect a particular field in /proc/[pid]/status to have a particular value,
+// and it doesn't, we shouldn't panic. On the other hand, we should feel free to assert that some
+// purely internal invariant holds, and panic if it doesn't.
+//
+
+fn usage(program: &str, opts: Options) -> ! {
+    usage_impl(program, opts, false);
+}
+
+fn usage_err(program: &str, opts: Options) -> ! {
+    usage_impl(program, opts, true);
+}
+
+fn usage_impl(program: &str, opts: Options, error: bool) -> ! {
+    print!("{}\n", opts.short_usage(program));
+    std::process::exit(if error { 1 } else { 0 });
+}
+
+fn open_or_exit(filename: &str) -> File {
+    match File::open(filename) {
+        Ok(f) => f,
+        Err(e) => {
+            eprint!("{} {}\n", filename, e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn print_args(pid: u64) {
+    let file = open_or_exit(&format!("/proc/{}/cmdline", pid));
+    print_proc_summary(pid);
+
+    for (i, bytes) in BufReader::new(file).split('\0' as u8).enumerate() {
+        let bytes = &bytes.unwrap();
+        let arg = from_utf8(bytes).unwrap();
+        println!("argv[{}]: {}", i, arg);
+    }
+}
+
+fn print_env(pid: u64) {
+    // This contains the environ as it was when the proc was started. To get the current
+    // environment, we need to inspect its memory to find out how it has change. POSIX defines a
+    // char **__environ symbol that we will need to find. Unfortunately, inspecting the memory of
+    // another process is not typically permitted, even if the process owned by the same user. See
+    // /etc/sysctl.d/10-ptrace.conf for details.
+    //
+    // Long term, we might want to print the current environment if we can, and print a warning
+    // + the contents of /proc/[pid]/environ if we can't
+    let file = open_or_exit(&format!("/proc/{}/environ", pid));
+    print_proc_summary(pid);
+
+    for (i, bytes) in BufReader::new(file).split('\0' as u8).enumerate() {
+        let bytes = &bytes.unwrap();
+        let arg = from_utf8(bytes).unwrap();
+        println!("envp[{}]: {}", i, arg);
+    }
+}
+
+// Print the pid and a summary of command line arguments on a single line.
+fn print_proc_summary(pid: u64) {
+    print!("{:8}", format!("{}:", pid));
+    print_cmd_summary(pid);
+}
+
+#[derive(Debug)]
+struct ParseError {
+    reason: String,
+}
+
+impl ParseError {
+    fn new(file: &str, reason: &str) -> Self {
+        ParseError {
+            reason: format!("Error parsing /proc/[pid]/{}: {}", file, reason),
+        }
+    }
+}
+
+impl Error for ParseError {
+    fn description(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.description())
+    }
+}
+
+// Info parsed from /proc/[pid]/status
+struct ProcStat {
+    pid: u64,
+    fields: HashMap<String, String>,
+}
+
+impl ProcStat {
+    // What is the stability of 'status' vs 'stat'? Is parsing this more likely to break? Overall,
+    // 'stat' seems better designed for parsing, _except_ ...
+    //
+    // The fields in /proc/[pid]/stat are separated by spaces. Unfortunately, the second field is
+    // the command, which can contain spaces. Without knowing what the command is beforehand, we
+    // can't parse this file reliably. We can read the command from /proc/[pid]/comm,
+    // so we know exactly what to expect, but that would be a pain.
+    //
+    fn read(pid: u64) -> Result<Self, Box<Error>> {
+        // /proc/[pid]/status contains lines of the form
+        //
+        //    Name:   bash
+        //    Umask:  0022
+        //    State:  S (sleeping)
+        //    ...
+
+        let status_file = ProcStat::status_file(pid);
+        let fields = BufReader::new(File::open(&status_file)?)
+            .lines()
+            .map(|s| {
+                let s: String = s?;
+                let substrs = s.splitn(2, ":").collect::<Vec<&str>>();
+                if substrs.len() < 2 {
+                    Err(ParseError::new(
+                        "status",
+                        &format!(
+                            "Fewer fields than expected in line '{}' of file {}",
+                            s, status_file
+                        ),
+                    ))?;
+                }
+                let key = substrs[0].to_string();
+                let value = substrs[1].trim().to_string();
+                Ok((key, value))
+            }).collect::<Result<HashMap<String, String>, Box<Error>>>()?;
+
+        Ok(ProcStat {
+            pid: pid,
+            fields: fields,
+        })
+    }
+
+    fn status_file(pid: u64) -> String {
+        format!("/proc/{}/status", pid)
+    }
+
+    fn get_field(&self, field: &str) -> Result<&str, Box<Error>> {
+        match self.fields.get(field) {
+            Some(val) => Ok(val),
+            None => Err(From::from(ParseError::new(
+                "status",
+                &format!(
+                    "Missing expected field '{}' file {}",
+                    field,
+                    ProcStat::status_file(self.pid)
+                ),
+            ))),
+        }
+    }
+
+    fn ppid(&self) -> Result<u64, Box<Error>> {
+        Ok(self.get_field("PPid")?.parse()?)
+    }
+}
+
+fn print_tree(pid_of_interest: u64) -> Result<(), Box<Error>> {
+    let mut child_map = HashMap::new(); // Map of pid to pids of children
+    let mut parent_map = HashMap::new(); // Map of pid to pid of parent
+
+    // Loop over all the processes listed in /proc/, find the parent of each one, and build a map
+    // from parent to children. There doesn't seem to be more effecient way of doing this reliably.
+    let num_regex = Regex::new(r"^\d+$").unwrap();
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let filename = filename.to_str().unwrap();
+        if num_regex.is_match(filename) {
+            let pid = filename.parse::<u64>().unwrap();
+            let ppid = match ProcStat::read(filename.parse::<u64>().unwrap()) {
+                Ok(proc_stat) => proc_stat.ppid()?, // TODO should we print error and continue?
+                // TODO print error before continuing unless err is file not found, which could
+                // happen if proc exited
+                Err(_) => continue,
+            };
+            child_map.entry(ppid).or_insert(vec![]).push(pid);
+            parent_map.insert(pid, ppid);
+        }
+    }
+
+    let indent_level = if pid_of_interest == 1 {
+        0
+    } else {
+        print_parents(&parent_map, pid_of_interest)
+    };
+    print_children(&child_map, pid_of_interest, indent_level);
+
+    Ok(())
+}
+
+// Print a summary of command line arguments on a single line.
+fn print_cmd_summary(pid: u64) {
+    let file = File::open(format!("/proc/{}/cmdline", pid)).unwrap();
+    for arg in BufReader::new(file).take(80).split('\0' as u8) {
+        print!("{} ", from_utf8(&arg.unwrap()).unwrap());
+    }
+    print!("\n");
+}
+
+// Returns the current indentation level
+fn print_parents(parent_map: &HashMap<u64, u64>, pid: u64) -> u64 {
+    // TODO need to handle the case where the parent exited before we could read the parent's
+    // parent.
+    let ppid = *parent_map.get(&pid).unwrap();
+
+    // We've reached the top of the process tree. Don't bother printing the parent if the parent
+    // is pid 1. Typically pid 1 didn't really start the process in question.
+    if ppid == 1 {
+        return 0;
+    }
+
+    let indent_level = print_parents(parent_map, ppid);
+    print_ptree_line(ppid, indent_level);
+    return indent_level + 1;
+}
+
+fn print_children(child_map: &HashMap<u64, Vec<u64>>, pid: u64, indent_level: u64) {
+    print_ptree_line(pid, indent_level);
+    if let Some(children) = child_map.get(&pid) {
+        for child in children.iter() {
+            print_children(child_map, *child, indent_level + 1);
+        }
+    }
+}
+
+fn print_ptree_line(pid: u64, indent_level: u64) {
+    for _ in 0..indent_level {
+        print!("  ");
+    }
+    print!("{}  ", pid);
+    print_cmd_summary(pid);
+}
+
+fn file_type_str(mode: u32) -> &'static str {
+    match SFlag::from_bits_truncate(mode & SFlag::S_IFMT.bits()) {
+        SFlag::S_IFSOCK => "S_IFSOCK",
+        SFlag::S_IFLNK => "S_IFLNK",
+        SFlag::S_IFREG => "S_IFREG",
+        SFlag::S_IFBLK => "S_IFBLK",
+        SFlag::S_IFDIR => "S_IFDIR",
+        SFlag::S_IFCHR => "S_IFCHR",
+        SFlag::S_IFIFO => "S_IFIFO",
+        // TODO currently epoll fds fall into this 'unkown' category. Is their type defined in any
+        // header?
+        _ => "UNKNOWN_TYPE",
+    }
+}
+
+fn print_open_flags(flags: u64) {
+    let open_flags = vec![
+        (OFlag::O_APPEND, "O_APPEND"),
+        (OFlag::O_ASYNC, "O_ASYNC"),
+        (OFlag::O_CLOEXEC, "O_CLOEXEC"),
+        (OFlag::O_CREAT, "O_CREAT"),
+        (OFlag::O_DIRECT, "O_DIRECT"),
+        (OFlag::O_DIRECTORY, "O_DIRECTORY"),
+        (OFlag::O_DSYNC, "O_DSYNC"),
+        (OFlag::O_EXCL, "O_EXCL"),
+        (OFlag::O_LARGEFILE, "O_LARGEFILE"),
+        (OFlag::O_NOATIME, "O_NOATIME"),
+        (OFlag::O_NOCTTY, "O_NOCTTY"),
+        (OFlag::O_NOFOLLOW, "O_NOFOLLOW"),
+        (OFlag::O_NONBLOCK, "O_NONBLOCK"),
+        (OFlag::O_PATH, "O_PATH"),
+        (OFlag::O_SYNC, "O_SYNC"),
+        (OFlag::O_TMPFILE, "O_TMPFILE"),
+        (OFlag::O_TRUNC, "O_TRUNC"),
+    ];
+
+    print!(
+        "{}",
+        match OFlag::from_bits_truncate(flags as i32 & OFlag::O_ACCMODE.bits()) {
+            OFlag::O_RDONLY => "O_RDONLY".to_string(),
+            OFlag::O_WRONLY => "O_WRONLY".to_string(),
+            OFlag::O_RDWR => "O_RDWR".to_string(),
+            _ => format!("Unexpected mode {:o}", flags),
+        }
+    );
+
+    // O_LARGEFILE == 0. Should that get printed everywhere?
+    // probably yes, if we want to match illumos
+
+    for &(flag, _desc) in open_flags.iter() {
+        if (flags as i32 & flag.bits()) != 0 {
+            print!("|{:?}", flag); // TODO don't use debug
+        }
+    }
+
+    // TODO why does illumos print close on exec separately?
+
+    print!("\n");
+}
+
+fn get_flags(pid: u64, fd: u64) -> u64 {
+    let mut contents = String::new();
+    File::open(format!("/proc/{}/fdinfo/{}", pid, fd))
+        .unwrap()
+        .read_to_string(&mut contents)
+        .unwrap();
+    let line = contents
+        .lines()
+        .filter(|line| line.starts_with("flags:"))
+        .collect::<Vec<&str>>()
+        .pop()
+        .unwrap();
+    let str_flags = line.replace("flags:", "");
+    u64::from_str_radix(str_flags.trim(), 8).unwrap()
+}
+
+fn print_file(pid: u64, fd: u64, sockets: &HashMap<u64, SockInfo>) {
+    let link_path_str = format!("/proc/{}/fd/{}", pid, fd);
+    let link_path = Path::new(&link_path_str);
+    let stat_info = stat(link_path).unwrap();
+
+    let file_type = stat_info.st_mode & SFlag::S_IFMT.bits();
+
+    print!(
+        " {: >4}: {} mode:{:o} dev:{},{} ino:{} uid:{} gid:{}",
+        fd,
+        file_type_str(stat_info.st_mode),
+        stat_info.st_mode & 0o7777,
+        major(stat_info.st_dev),
+        minor(stat_info.st_dev),
+        stat_info.st_ino,
+        stat_info.st_uid,
+        stat_info.st_gid
+    );
+
+    let rdev_major = major(stat_info.st_rdev);
+    let rdev_minor = minor(stat_info.st_rdev);
+    if rdev_major == 0 && rdev_minor == 0 {
+        print!(" size:{}\n", stat_info.st_size)
+    } else {
+        print!(" rdev:{},{}\n", rdev_major, rdev_minor);
+    }
+
+    print!("       ");
+    print_open_flags(get_flags(pid, fd));
+
+    if file_type == SFlag::S_IFSOCK.bits() {
+        // TODO what to do if there is no entry in /proc/net/tcp corresponding to the inode?
+        // TODO use sshd as example
+        // TODO make sure we are displying information that is for the correct namespace
+        let sock_info = sockets.get(&stat_info.st_ino).unwrap(); // TODO add error msg saying not found (until we implement logic for handling IPv6)
+        print_sock_type(sock_info.sock_type);
+        print_sock_address(&sock_info);
+    } else {
+        let path = fs::read_link(link_path).unwrap();
+        print!("       {}\n", path.to_str().unwrap());
+    }
+}
+
+// Corresponds to definitions in include/net/tcp_states.h in the kernel
+enum TcpSockState {
+    Established = 1,
+    SynSent,
+    SynRecv,
+    FinWait1,
+    FinWait2,
+    TimeWait,
+    Close,
+    CloseWait,
+    LastAck,
+    Listen,
+    Closing,
+    NewSynRecv,
+}
+
+#[derive(Debug)]
+struct SockInfo {
+    family: AddressFamily,
+    sock_type: SockType,
+    inode: u64,
+    local_addr: Option<SocketAddr>, // Doesn't apply to unix sockets
+    peer_addr: Option<SocketAddr>,  // Doesn't apply to unix sockets
+    peer_pid: Option<u64>,          // If the peer is another process on this system
+                                    // TODO state: Option<SockState>, // TCP only
+}
+
+fn print_sock_type(sock_type: SockType) {
+    println!(
+        "         {}",
+        match sock_type {
+            SockType::Stream => "SOCK_STREAM",
+            SockType::Datagram => "SOCK_DGRAM",
+            SockType::SeqPacket => "SOCK_SEQPACKET",
+            SockType::Raw => "SOCK_RAW",
+            SockType::Rdm => "SOCK_RDM",
+        }
+    )
+}
+
+fn address_family_str(addr_fam: AddressFamily) -> &'static str {
+    match addr_fam {
+        AddressFamily::Unix => "AF_UNIX",
+        AddressFamily::Inet => "AF_INET",
+        AddressFamily::Inet6 => "AF_INET6",
+        AddressFamily::Netlink => "AF_NETLINK",
+        AddressFamily::Packet => "AF_PACKET",
+        AddressFamily::Ipx => "AF_IPX",
+        AddressFamily::X25 => "AF_X25",
+        AddressFamily::Ax25 => "AF_AX25",
+        AddressFamily::AtmPvc => "AF_ATMPVC",
+        AddressFamily::AppleTalk => "AF_APPLETALK",
+        AddressFamily::Alg => "AF_ALG",
+        AddressFamily::NetRom => "AF_NETROM",
+        AddressFamily::Bridge => "AF_BRIDGE",
+        AddressFamily::Rose => "AF_ROSE",
+        AddressFamily::Decnet => "AF_DECNET",
+        AddressFamily::NetBeui => "AF_NETBEUI",
+        AddressFamily::Security => "AF_SECURITY",
+        AddressFamily::Key => "AF_KEY",
+        AddressFamily::Ash => "AF_ASH",
+        AddressFamily::Econet => "AF_ECONET",
+        AddressFamily::AtmSvc => "AF_ATMSVC",
+        AddressFamily::Rds => "AF_RDS",
+        AddressFamily::Sna => "AF_SNA",
+        AddressFamily::Irda => "AF_IRDA",
+        AddressFamily::Pppox => "AF_PPPOX",
+        AddressFamily::Wanpipe => "AF_WANPIPE",
+        AddressFamily::Llc => "AF_LLC",
+        AddressFamily::Ib => "AF_IB",
+        AddressFamily::Mpls => "AF_MPLS",
+        AddressFamily::Can => "AF_CAN",
+        AddressFamily::Tipc => "AF_TIPC",
+        AddressFamily::Bluetooth => "AF_BLUETOOTH",
+        AddressFamily::Iucv => "AF_IUCV",
+        AddressFamily::RxRpc => "AF_RXRPC",
+        AddressFamily::Isdn => "AF_ISDN",
+        AddressFamily::Phonet => "AF_PHONET",
+        AddressFamily::Ieee802154 => "AF_IEEE802154",
+        AddressFamily::Caif => "AF_CAIF",
+        AddressFamily::Nfc => "AF_NFC",
+        AddressFamily::Vsock => "AF_VSOCK",
+    }
+}
+
+fn inet_address_str(addr_fam: AddressFamily, addr: Option<SocketAddr>) -> String {
+    format!(
+        "{} {}",
+        address_family_str(addr_fam),
+        if let Some(addr) = addr {
+            format!("{}  port: {}", addr.ip(), addr.port())
+        } else {
+            "".to_string()
+        }
+    )
+}
+
+fn print_sock_address(sock_info: &SockInfo) {
+    println!(
+        "         sockname: {}",
+        match sock_info.family {
+            AddressFamily::Inet => inet_address_str(sock_info.family, sock_info.local_addr),
+            AddressFamily::Inet6 => inet_address_str(sock_info.family, sock_info.local_addr),
+            addr_fam => address_family_str(addr_fam).to_string(),
+        }
+    );
+
+    // If we have some additional info to print about the remote side of this socket, print it here
+
+    // TODO check that addr is not 0.0.0.0 or :: (Actually, should we make it such that sockaddrs
+    // are none in these cases)?
+    if let Some(addr) = sock_info.peer_addr {
+        if addr.ip() != IpAddr::from([0, 0, 0, 0])
+            && addr.ip() != IpAddr::from([0, 0, 0, 0, 0, 0, 0, 0])
+        {
+            println!(
+                "         peername: {} ",
+                inet_address_str(sock_info.family, Some(addr))
+            );
+        }
+    }
+    // TODO for unix sockets, or for tcp connections connected to another process on this machine,
+    // see if we can find and print the pid/comm of the other process
+}
+
+// TODO handle case where doesn't match
+fn parse_sock_type(type_code: &str) -> SockType {
+    match type_code.parse::<u64>().unwrap() {
+        1 => SockType::Stream,
+        2 => SockType::Datagram,
+        5 => SockType::SeqPacket,
+        _ => panic!("unknown type"), // TODO
+    }
+}
+
+// Parse a socket address of the form "0100007F:1538" (i.e. 127.0.0.1:1538)
+fn parse_ipv4_sock_addr(s: &str) -> Result<SocketAddr, Box<Error>> {
+    let port = u16::from_str_radix(s.split(':').collect::<Vec<&str>>()[1], 16).unwrap();
+    let addr = u32::from_str_radix(s.split(':').collect::<Vec<&str>>()[0], 16).unwrap();
+    // TODO do we need to change 'addr' to network order?
+    let addr = Ipv4Addr::new(
+        ((addr >> 24) & 0xFF) as u8,
+        ((addr >> 16) & 0xFF) as u8,
+        ((addr >> 8) & 0xFF) as u8,
+        (addr & 0xFF) as u8,
+    );
+
+    Ok(SocketAddr::new(IpAddr::V4(addr), port))
+}
+
+// TODO it isn't ideal to have to go through all of the info in
+// /proc/net/{tcp,tcp6,udp,udp6,raw,...} every time we want to the get the info for
+// a single socket. Is there a faster way to do this for a single socket?
+fn fetch_sock_info(pid: u64) -> Result<HashMap<u64, SockInfo>, Box<Error>> {
+    let file = File::open(format!("/proc/{}/net/unix", pid)).unwrap();
+    let mut sockets = BufReader::new(file)
+              .lines()
+              .skip(1) // Header
+              .map(|line| {
+                  let line = line.unwrap();
+                  let fields = line.split_whitespace().collect::<Vec<&str>>();
+                  let inode = fields[6].parse().unwrap();
+                  let sock_info = SockInfo {
+                      family: AddressFamily::Unix,
+                      sock_type: parse_sock_type(fields[4]),
+                      inode: inode,
+                      local_addr: None,
+                      peer_addr: None,
+                      peer_pid: None,
+                  };
+                  (inode, sock_info)
+              }).collect::<HashMap<_,_>>();
+
+    let parse_file = |file, s_type| {
+        BufReader::new(file)
+              .lines()
+              .skip(1) // Header
+              .map(|line| {
+                  let line = line.unwrap();
+                  let fields = line.split_whitespace().collect::<Vec<&str>>();
+                  let inode = fields[9].parse().unwrap();
+                  let sock_info = SockInfo {
+                      family: AddressFamily::Inet,
+                      sock_type: s_type,
+                      local_addr: Some(parse_ipv4_sock_addr(fields[1]).unwrap()),
+                      peer_addr: Some(parse_ipv4_sock_addr(fields[2]).unwrap()),
+                      peer_pid: None,
+                      //state: u64::from_str_radix(fields[3], 16).unwrap(),
+                      inode: inode,
+                  };
+                  (inode, sock_info)
+              }).collect::<Vec<_>>().into_iter() // TODO the collect().into_iter() is obviously bad
+    };
+
+    sockets.extend(parse_file(
+        File::open(format!("/proc/{}/net/tcp", pid)).unwrap(),
+        SockType::Stream,
+    ));
+    sockets.extend(parse_file(
+        File::open(format!("/proc/{}/net/udp", pid)).unwrap(),
+        SockType::Datagram,
+    ));
+    sockets.extend(parse_file(
+        File::open(format!("/proc/{}/net/raw", pid)).unwrap(),
+        SockType::Raw,
+    ));
+
+    Ok(sockets)
+}
+
+/*
+ * Some things about Illumos pfiles output seem less than ideal. For instance, would
+ * printing 'TCP' be preferrable to 'SOCK_STREAM'? Could we add somewhere in output the
+ * psuedo file for the socket? That could be very useful for manually inspecting or
+ * draining the output.
+ *
+ *    435: S_IFSOCK mode:0666 dev:556,0 ino:38252 uid:0 gid:0 rdev:0,0
+ *         O_RDWR
+ *           SOCK_STREAM
+ *           SO_SNDBUF(16384),SO_RCVBUF(5120)
+ *           sockname: AF_UNIX
+ *           peer: java[1053] zone: global[0]
+ *
+ * Another example: we can guess by the way that there is no peer address that this socket
+ * is listening. Could we make this more explicit? Even for sockets that aren't listening, it
+ * might be really useful to know the state of the connection
+ *
+ *    436: S_IFSOCK mode:0666 dev:556,0 ino:37604 uid:0 gid:0 rdev:0,0
+ *         O_RDWR|O_NONBLOCK
+ *           SOCK_STREAM
+ *           SO_REUSEADDR,SO_SNDBUF(16777216),SO_RCVBUF(4194304)
+ *           sockname: AF_INET6 ::  port: 8341
+ */
+
+fn print_files(pid: u64) {
+    print_proc_summary(pid);
+
+    // TODO print current rlimit
+
+    // TODO BLOCKER handle permission errors by printing an error instead of just
+    // not printing anything
+
+    let sockets = fetch_sock_info(pid).unwrap();
+
+    if let Ok(entries) = fs::read_dir(format!("/proc/{}/fd/", pid)) {
+        for entry in entries {
+            let entry = entry.unwrap();
+            let filename = entry.file_name();
+            let filename = filename.to_str().unwrap();
+            if let Ok(fd) = filename.parse::<u64>() {
+                print_file(pid, fd, &sockets);
+            } else {
+                eprint!("Unexpected file /proc/pid/fd/{} found", filename);
+            }
+        }
+    }
+}
+
+pub fn pargs_main() {
+    let args: Vec<String> = env::args().collect();
+    let program = &args[0];
+
+    let opts = {
+        let mut opts = Options::new();
+        opts.optflag("a", "", "Print command line args to process");
+        // We have a separate penv command, but keep this option for compatibility with Solaris
+        opts.optflag("e", "", "Print environement variables of process");
+        opts.optflag("h", "help", "print this help message");
+        opts.parsing_style(ParsingStyle::StopAtFirstFree);
+        opts
+    };
+
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => m,
+        Err(e) => {
+            eprint!("{}\n", e.to_string());
+            usage_err(program, opts);
+        }
+    };
+
+    if matches.opt_present("h") {
+        usage(program, opts);
+    }
+
+    if matches.free.len() == 0 {
+        usage_err(program, opts);
+    }
+
+    let do_print_args = matches.opt_present("a");
+    let do_print_env = matches.opt_present("e");
+
+    for arg in &matches.free {
+        let pid = arg.parse::<u64>().unwrap();
+        if do_print_args || !do_print_env {
+            print_args(pid);
+        }
+
+        if do_print_env {
+            print_env(pid);
+        }
+    }
+}
+
+pub fn penv_main() {
+    let args: Vec<String> = env::args().collect();
+    let program = &args[0];
+
+    let opts = {
+        let mut opts = Options::new();
+        opts.optflag("h", "help", "print this help message");
+        opts.parsing_style(ParsingStyle::StopAtFirstFree);
+        opts
+    };
+
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => m,
+        Err(e) => {
+            eprint!("{}\n", e.to_string());
+            usage_err(program, opts);
+        }
+    };
+
+    if matches.opt_present("h") {
+        usage(program, opts);
+    }
+
+    if matches.free.len() == 0 {
+        usage_err(program, opts);
+    }
+
+    for arg in &matches.free {
+        let pid = arg.parse::<u64>().unwrap();
+        print_env(pid);
+    }
+}
+
+pub fn pfiles_main() {
+    let args: Vec<String> = env::args().collect();
+    let program = &args[0];
+
+    let opts = {
+        let mut opts = Options::new();
+        opts.optflag("h", "help", "print this help message");
+        opts.parsing_style(ParsingStyle::StopAtFirstFree);
+        opts
+    };
+
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => m,
+        Err(e) => {
+            eprint!("{}\n", e.to_string());
+            usage_err(program, opts);
+        }
+    };
+
+    if matches.opt_present("h") {
+        usage(program, opts);
+    }
+
+    if matches.free.len() == 0 {
+        usage_err(program, opts);
+    }
+
+    for arg in &matches.free {
+        let pid = arg.parse::<u64>().unwrap();
+        print_files(pid);
+    }
+}
+
+pub fn ptree_main() {
+    let args: Vec<String> = env::args().collect();
+    let program = &args[0];
+
+    let opts = {
+        let mut opts = Options::new();
+        opts.optflag("h", "help", "print this help message");
+        opts.parsing_style(ParsingStyle::StopAtFirstFree);
+        opts
+    };
+
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => m,
+        Err(e) => {
+            eprint!("{}\n", e.to_string());
+            usage_err(program, opts);
+        }
+    };
+
+    if matches.opt_present("h") {
+        usage(program, opts);
+    }
+
+    if matches.free.len() == 0 {
+        // Should we print all processes here, including kernel threads? Is there any way this
+        // could miss userspace processes?
+        print_tree(1).unwrap();
+    } else {
+        // This loop parses /proc/<pid>/status for each process in the system for each
+        // argument provided. Should rearrange it so it's only parsed once.
+        for arg in &matches.free {
+            let pid = arg.parse::<u64>().unwrap();
+            print_tree(pid).unwrap();
+        }
+    }
+}

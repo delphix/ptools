@@ -1,0 +1,34 @@
+[package]
+name = "ptools"
+version = "0.1.0"
+authors = ["John Gallagher"]
+
+[lib]
+name = "ptools"
+path = "src/ptools.rs"
+
+[[bin]]
+name = "pargs"
+path = "src/bin/pargs.rs"
+[[bin]]
+name = "penv"
+path = "src/bin/penv.rs"
+[[bin]]
+name = "pfiles"
+path = "src/bin/pfiles.rs"
+[[bin]]
+name = "ptree"
+path = "src/bin/ptree.rs"
+
+
+[profile.release]
+lto = true
+panic = "abort" # Save size. We don't need unwinding anyway.
+# TODO is there any way to remove the ability to display backtraces? This would
+# likely shave another 50K or so off the binary size, and may not be necessary
+# if systems are typically configured to dump core on SIGABRT
+
+[dependencies]
+getopts = "0.2.15"
+regex = "0.2"
+nix = "0.10.0"
