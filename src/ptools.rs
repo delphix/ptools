@@ -303,18 +303,106 @@ fn print_ptree_line(pid: u64, indent_level: u64) {
     print_cmd_summary(pid);
 }
 
-fn file_type_str(mode: u32) -> &'static str {
-    match SFlag::from_bits_truncate(mode & SFlag::S_IFMT.bits()) {
-        SFlag::S_IFSOCK => "S_IFSOCK",
-        SFlag::S_IFLNK => "S_IFLNK",
-        SFlag::S_IFREG => "S_IFREG",
-        SFlag::S_IFBLK => "S_IFBLK",
-        SFlag::S_IFDIR => "S_IFDIR",
-        SFlag::S_IFCHR => "S_IFCHR",
-        SFlag::S_IFIFO => "S_IFIFO",
-        // TODO currently epoll fds fall into this 'unkown' category. Is their type defined in any
-        // header?
-        _ => "UNKNOWN_TYPE",
+// As defined by the file type bits of the st_mode field returned by stat
+#[derive(PartialEq)]
+enum PosixFileType {
+    Regular,
+    Directory,
+    Socket,
+    SymLink,
+    BlockDevice,
+    CharDevice,
+    Fifo,
+    Unknown(u32),
+}
+
+// As defined by contents of the symlink for the file descriptor in /proc/[pid]/fd/, which has the
+// form 'anon_inode:[eventpoll]' TODO better comment
+#[derive(PartialEq)]
+enum AnonFileType {
+    Bpf,
+    Epoll,
+    Unknown(String),
+}
+
+#[derive(PartialEq)]
+enum FileType {
+    Posix(PosixFileType),
+    Anon(AnonFileType),
+    Unknown,
+}
+
+// Some common types of files have their type described by the st_mode returned by stat. For certain
+// types of files, though, st_mode is zero. In this case we can try to get more info from the text
+// in /proc/[pid]/fd/[fd]
+fn file_type(mode: u32, link_path: &Path) -> FileType {
+    let mode = mode & SFlag::S_IFMT.bits();
+    if mode != 0 {
+        let posix_file_type = match SFlag::from_bits_truncate(mode) {
+            SFlag::S_IFSOCK => PosixFileType::Socket,
+            SFlag::S_IFLNK => PosixFileType::SymLink,
+            SFlag::S_IFREG => PosixFileType::Regular,
+            SFlag::S_IFBLK => PosixFileType::BlockDevice,
+            SFlag::S_IFDIR => PosixFileType::Directory,
+            SFlag::S_IFCHR => PosixFileType::CharDevice,
+            SFlag::S_IFIFO => PosixFileType::Fifo,
+            x => PosixFileType::Unknown(mode),
+        };
+        FileType::Posix(posix_file_type)
+    } else {
+        // Symlinks normally contain name of another file, but the contents of /proc/[pid]/fd/[fd]
+        // is in this case just text. fs::read_link converts this arbitrary text to a path, and then
+        // we convert it back to a String here. We are assuming this conversion is lossless.
+        let faux_path = match fs::read_link(link_path) {
+           Ok(faux_path) => faux_path,
+            Err(e) => {
+                eprintln!("Failed to read {:?}: {}", link_path, e);
+                return FileType::Unknown
+            }
+        };
+        let fd_info = match faux_path.to_str() {
+            Some(fd_info) => fd_info,
+            None => {
+                eprintln!("Failed to convert path to string: {:?}", faux_path);
+                return FileType::Unknown
+            }
+        };
+        // For anonymous inodes, this text has the format 'anon_inode:[<type>]' or
+        // 'anon_inode:<type>'.
+        if fd_info.starts_with("anon_inode:") {
+            let fd_type_str = fd_info.trim_start_matches("anon_inode:").trim_start_matches("[").trim_end_matches("]");
+            let anon_file_type = match fd_type_str {
+                "eventpoll" => AnonFileType::Epoll,
+                x => AnonFileType::Unknown(x.to_string()),
+            };
+            FileType::Anon(anon_file_type)
+        } else {
+            FileType::Unknown
+        }
+    }
+}
+
+fn print_file_type(file_type: &FileType) -> String {
+    match file_type {
+        // For now we print the Posix file types using the somewhat cryptic macro identifiers used
+        // by the st_mode field returned by stat to match what is printed on Solaris. However, given
+        // that we already have more file types than we do on Solaris (because of Linux specific
+        // things like epoll, for example), and given that these additional file types can't be
+        // printed using S_ names (since they don't exist for these file types, since they aren't
+        // understood by stat), we are printing names that are sort of inconsistent. Maybe we should
+        // just be consistent, print better names, and just break compatibility with Solaris pfiles.
+        FileType::Posix(PosixFileType::Regular) => "S_IFREG".into(),
+        FileType::Posix(PosixFileType::Directory) => "S_IFDIR".into(),
+        FileType::Posix(PosixFileType::Socket) => "S_IFSOCK".into(),
+        FileType::Posix(PosixFileType::SymLink) => "S_IFLNK".into(),
+        FileType::Posix(PosixFileType::BlockDevice) => "S_IFBLK".into(),
+        FileType::Posix(PosixFileType::CharDevice) => "S_IFCHR".into(),
+        FileType::Posix(PosixFileType::Fifo) => "S_IFIFO".into(),
+        FileType::Posix(PosixFileType::Unknown(x)) => format!("UNKNOWN_TYPE(mode={})", x),
+        FileType::Anon(AnonFileType::Epoll) => "anon_inode(epoll)".into(),
+        FileType::Anon(AnonFileType::Bpf) => "anon_inode(bpf)".into(),
+        FileType::Anon(AnonFileType::Unknown(s)) => format!("anon_inode({})", s),
+        FileType::Unknown => "UNKNOWN_TYPE".into(),
     }
 }
 
@@ -384,12 +472,12 @@ fn print_file(pid: u64, fd: u64, sockets: &HashMap<u64, SockInfo>) {
     let link_path = Path::new(&link_path_str);
     let stat_info = stat(link_path).unwrap();
 
-    let file_type = stat_info.st_mode & SFlag::S_IFMT.bits();
+    let file_type = file_type(stat_info.st_mode, &link_path);
 
     print!(
         " {: >4}: {} mode:{:o} dev:{},{} ino:{} uid:{} gid:{}",
         fd,
-        file_type_str(stat_info.st_mode),
+        print_file_type(&file_type),
         stat_info.st_mode & 0o7777,
         major(stat_info.st_dev),
         minor(stat_info.st_dev),
@@ -409,16 +497,20 @@ fn print_file(pid: u64, fd: u64, sockets: &HashMap<u64, SockInfo>) {
     print!("       ");
     print_open_flags(get_flags(pid, fd));
 
-    if file_type == SFlag::S_IFSOCK.bits() {
-        // TODO what to do if there is no entry in /proc/net/tcp corresponding to the inode?
-        // TODO use sshd as example
-        // TODO make sure we are displying information that is for the correct namespace
-        let sock_info = sockets.get(&stat_info.st_ino).unwrap(); // TODO add error msg saying not found (until we implement logic for handling IPv6)
-        print_sock_type(sock_info.sock_type);
-        print_sock_address(&sock_info);
-    } else {
-        let path = fs::read_link(link_path).unwrap();
-        print!("       {}\n", path.to_str().unwrap());
+    // TODO we can print more specific information for epoll fds by looking at /proc/[pid]/fdinfo/[fd]
+    match file_type {
+        FileType::Posix(PosixFileType::Socket) => {
+            // TODO what to do if there is no entry in /proc/net/tcp corresponding to the inode?
+            // TODO use sshd as example
+            // TODO make sure we are displaying information that is for the correct namespace
+            let sock_info = sockets.get(&stat_info.st_ino).unwrap(); // TODO add error msg saying not found (until we implement logic for handling IPv6)
+            print_sock_type(sock_info.sock_type);
+            print_sock_address(&sock_info);
+        },
+        _ => {
+            let path = fs::read_link(link_path).unwrap();
+            print!("       {}\n", path.to_str().unwrap());
+        }
     }
 }
 
@@ -504,6 +596,7 @@ fn address_family_str(addr_fam: AddressFamily) -> &'static str {
         AddressFamily::Caif => "AF_CAIF",
         AddressFamily::Nfc => "AF_NFC",
         AddressFamily::Vsock => "AF_VSOCK",
+        AddressFamily::Unspec => panic!("Need to handle this case"), // TODO
     }
 }
 

@@ -20,6 +20,9 @@ path = "src/bin/pfiles.rs"
 name = "ptree"
 path = "src/bin/ptree.rs"
 
+[[bin]]
+name = "epoll_example"
+path = "src/bin/testing/epoll.rs"
 
 [profile.release]
 lto = true
@@ -31,4 +34,14 @@ panic = "abort" # Save size. We don't need unwinding anyway.
 [dependencies]
 getopts = "0.2.15"
 regex = "0.2"
-nix = "0.10.0"
+nix = "0.12.0"
+
+[package.metadata.deb]
+assets = [
+  # List files we want explicitly so that we don't get the binaries intended for
+  # testing.
+  ["target/release/pargs", "usr/bin/", "755"],
+  ["target/release/penv", "usr/bin/", "755"],
+  ["target/release/pfiles", "usr/bin/", "755"],
+  ["target/release/ptree", "usr/bin/", "755"],
+]
