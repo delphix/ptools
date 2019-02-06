@@ -22,14 +22,12 @@ static ALLOCATOR: System = System;
 
 extern crate getopts;
 extern crate nix;
-extern crate regex;
 
 use getopts::{Options, ParsingStyle};
 
 use nix::fcntl::OFlag;
 use nix::sys::socket::{AddressFamily, SockType};
 use nix::sys::stat::{major, minor, stat, SFlag};
-use regex::Regex;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
@@ -231,15 +229,13 @@ fn print_tree(pid_of_interest: u64) -> Result<(), Box<Error>> {
     let mut parent_map = HashMap::new(); // Map of pid to pid of parent
 
     // Loop over all the processes listed in /proc/, find the parent of each one, and build a map
-    // from parent to children. There doesn't seem to be more effecient way of doing this reliably.
-    let num_regex = Regex::new(r"^\d+$").unwrap();
+    // from parent to children. There doesn't seem to be more efficient way of doing this reliably.
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
         let filename = entry.file_name();
         let filename = filename.to_str().unwrap();
-        if num_regex.is_match(filename) {
-            let pid = filename.parse::<u64>().unwrap();
-            let ppid = match ProcStat::read(filename.parse::<u64>().unwrap()) {
+        if let Ok(pid) = filename.parse::<u64>() {
+            let ppid = match ProcStat::read(pid) {
                 Ok(proc_stat) => proc_stat.ppid()?, // TODO should we print error and continue?
                 // TODO print error before continuing unless err is file not found, which could
                 // happen if proc exited
@@ -346,7 +342,7 @@ fn file_type(mode: u32, link_path: &Path) -> FileType {
             SFlag::S_IFDIR => PosixFileType::Directory,
             SFlag::S_IFCHR => PosixFileType::CharDevice,
             SFlag::S_IFIFO => PosixFileType::Fifo,
-            x => PosixFileType::Unknown(mode),
+            _ => PosixFileType::Unknown(mode),
         };
         FileType::Posix(posix_file_type)
     } else {
