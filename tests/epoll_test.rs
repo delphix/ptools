@@ -2,9 +2,6 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use std::io;
 use std::process::{Command, Stdio};
-use regex::Regex;
-
-extern crate regex;
 
 // Find an executable produced by the Cargo build
 fn find_exec(name: &str) -> PathBuf {
@@ -50,9 +47,9 @@ fn test_epoll() {
     let stdout = String::from_utf8_lossy(&pfiles_output.stdout);
     assert_eq!(stderr, "");
 
-    let pattern = regex::escape("7: anon_inode(epoll)");
-    if !Regex::new(&pattern).unwrap().is_match(&stdout) {
-        panic!("{} not found in command output:\n\n{}\n\n", pattern, stdout);
+    let pattern = "5: anon_inode(epoll)";
+    if !stdout.contains(pattern) {
+        panic!("String '{}' not found in command output:\n\n{}\n\n", pattern, stdout);
     }
 
     example_proc.kill().unwrap();
