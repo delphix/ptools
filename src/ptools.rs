@@ -646,17 +646,15 @@ fn parse_sock_type(type_code: &str) -> SockType {
     }
 }
 
-// Parse a socket address of the form "0100007F:1538" (i.e. 127.0.0.1:1538)
+// Parse a socket address of the form "0100007F:1538" (i.e. 127.0.0.1:5432)
 fn parse_ipv4_sock_addr(s: &str) -> Result<SocketAddr, Box<Error>> {
+    // Port is always printed with most-significant byte first.
     let port = u16::from_str_radix(s.split(':').collect::<Vec<&str>>()[1], 16).unwrap();
-    let addr = u32::from_str_radix(s.split(':').collect::<Vec<&str>>()[0], 16).unwrap();
-    // TODO do we need to change 'addr' to network order?
-    let addr = Ipv4Addr::new(
-        ((addr >> 24) & 0xFF) as u8,
-        ((addr >> 16) & 0xFF) as u8,
-        ((addr >> 8) & 0xFF) as u8,
-        (addr & 0xFF) as u8,
-    );
+
+    // Address is printed with most-significant byte first on big-endian systems and vice-versa on
+    // little-endian systems.
+    let addr_native_endian = u32::from_str_radix(s.split(':').collect::<Vec<&str>>()[0], 16).unwrap();
+    let addr = Ipv4Addr::from(addr_native_endian.to_be());
 
     Ok(SocketAddr::new(IpAddr::V4(addr), port))
 }
