@@ -133,7 +133,12 @@ struct ParseError {
 }
 
 impl ParseError {
-    fn new(file: &str, reason: &str) -> Self {
+    fn new(item: &str, reason: &str) -> Self {
+        ParseError {
+            reason: format!("Error parsing {}: {}", item, reason),
+        }
+    }
+    fn in_file(file: &str, reason: &str) -> Self {
         ParseError {
             reason: format!("Error parsing /proc/[pid]/{}: {}", file, reason),
         }
@@ -182,7 +187,7 @@ impl ProcStat {
                 let s: String = s?;
                 let substrs = s.splitn(2, ":").collect::<Vec<&str>>();
                 if substrs.len() < 2 {
-                    Err(ParseError::new(
+                    Err(ParseError::in_file(
                         "status",
                         &format!(
                             "Fewer fields than expected in line '{}' of file {}",
@@ -208,7 +213,7 @@ impl ProcStat {
     fn get_field(&self, field: &str) -> Result<&str, Box<Error>> {
         match self.fields.get(field) {
             Some(val) => Ok(val),
-            None => Err(From::from(ParseError::new(
+            None => Err(From::from(ParseError::in_file(
                 "status",
                 &format!(
                     "Missing expected field '{}' file {}",
@@ -647,13 +652,25 @@ fn parse_sock_type(type_code: &str) -> SockType {
 }
 
 // Parse a socket address of the form "0100007F:1538" (i.e. 127.0.0.1:5432)
-fn parse_ipv4_sock_addr(s: &str) -> Result<SocketAddr, Box<Error>> {
+fn parse_ipv4_sock_addr(s: &str) -> Result<SocketAddr, ParseError> {
+    let mk_err = || {
+        ParseError::new(
+            "IPv4 address",
+            &format!("expected address in form '0100007F:1538', got {}", s),
+        )
+    };
+
+    let fields = s.split(':').collect::<Vec<_>>();
+    if fields.len() != 2 {
+        return Err(mk_err());
+    }
+
     // Port is always printed with most-significant byte first.
-    let port = u16::from_str_radix(s.split(':').collect::<Vec<&str>>()[1], 16).unwrap();
+    let port = u16::from_str_radix(fields[1], 16).map_err(|_| mk_err())?;
 
     // Address is printed with most-significant byte first on big-endian systems and vice-versa on
     // little-endian systems.
-    let addr_native_endian = u32::from_str_radix(s.split(':').collect::<Vec<&str>>()[0], 16).unwrap();
+    let addr_native_endian = u32::from_str_radix(fields[0], 16).map_err(|_| mk_err())?;
     let addr = Ipv4Addr::from(addr_native_endian.to_be());
 
     Ok(SocketAddr::new(IpAddr::V4(addr), port))
@@ -912,5 +929,22 @@ pub fn ptree_main() {
             let pid = arg.parse::<u64>().unwrap();
             print_tree(pid).unwrap();
         }
+    }
+}
+
+mod test {
+    use super::*;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn test_parse_ipv4_sock_addr() {
+        assert_eq!(
+            parse_ipv4_sock_addr("0100007F:1538").unwrap(),
+            "127.0.0.1:5432".parse::<SocketAddr>().unwrap()
+        );
+
+        assert!(parse_ipv4_sock_addr("0100007F 1538").is_err());
+        assert!(parse_ipv4_sock_addr("010000YY:1538").is_err());
+        assert!(parse_ipv4_sock_addr("0100007F:15YY").is_err());
     }
 }
