@@ -682,9 +682,6 @@ fn parse_ipv4_sock_addr(s: &str) -> Result<SocketAddr, ParseError> {
     Ok(SocketAddr::new(IpAddr::V4(addr), port))
 }
 
-// TODO it isn't ideal to have to go through all of the info in
-// /proc/net/{tcp,tcp6,udp,udp6,raw,...} every time we want to the get the info for
-// a single socket. Is there a faster way to do this for a single socket?
 fn fetch_sock_info(pid: u64) -> Result<HashMap<u64, SockInfo>, Box<Error>> {
     let file = File::open(format!("/proc/{}/net/unix", pid)).unwrap();
     let mut sockets = BufReader::new(file)
@@ -705,6 +702,27 @@ fn fetch_sock_info(pid: u64) -> Result<HashMap<u64, SockInfo>, Box<Error>> {
                   (inode, sock_info)
               }).collect::<HashMap<_,_>>();
 
+    let file = File::open(format!("/proc/{}/net/netlink", pid)).unwrap();
+    let netlink_sockets = BufReader::new(file)
+        .lines()
+        .skip(1) // Header
+        .map(|line| {
+            let line = line.unwrap();
+            let fields = line.split_whitespace().collect::<Vec<&str>>();
+            let inode = fields[9].parse().unwrap();
+            let sock_info = SockInfo {
+                family: AddressFamily::Netlink,
+                sock_type: SockType::Datagram,
+                inode: inode,
+                local_addr: None,
+                peer_addr: None,
+                peer_pid: None,
+            };
+            (inode, sock_info)
+        }).collect::<HashMap<_,_>>();
+    sockets.extend(netlink_sockets);
+
+    // procfs entries for tcp, udp, and raw sockets all use same format
     let parse_file = |file, s_type| {
         BufReader::new(file)
               .lines()
