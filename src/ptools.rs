@@ -501,12 +501,18 @@ fn print_file(pid: u64, fd: u64, sockets: &HashMap<u64, SockInfo>) {
     // TODO we can print more specific information for epoll fds by looking at /proc/[pid]/fdinfo/[fd]
     match file_type {
         FileType::Posix(PosixFileType::Socket) => {
-            // TODO what to do if there is no entry in /proc/net/tcp corresponding to the inode?
-            // TODO use sshd as example
+            // TODO We should read the 'system.sockprotoname' xattr for /proc/[pid]/fd/[fd] for
+            // sockets. That way we can at least print the protocol even if we weren't able to find
+            // any info for the socket in procfs.
             // TODO make sure we are displaying information that is for the correct namespace
-            let sock_info = sockets.get(&stat_info.st_ino).unwrap(); // TODO add error msg saying not found (until we implement logic for handling IPv6)
-            print_sock_type(sock_info.sock_type);
-            print_sock_address(&sock_info);
+            // TODO handle IPv6
+            if let Some(sock_info) = sockets.get(&stat_info.st_ino) {
+                print_sock_type(sock_info.sock_type);
+                print_sock_address(&sock_info);
+            } else {
+                print!("       ERROR: failed to find info for socket with inode num {}\n",
+                       stat_info.st_ino);
+            }
         },
         _ => {
             let path = fs::read_link(link_path).unwrap();
@@ -676,9 +682,6 @@ fn parse_ipv4_sock_addr(s: &str) -> Result<SocketAddr, ParseError> {
     Ok(SocketAddr::new(IpAddr::V4(addr), port))
 }
 
-// TODO it isn't ideal to have to go through all of the info in
-// /proc/net/{tcp,tcp6,udp,udp6,raw,...} every time we want to the get the info for
-// a single socket. Is there a faster way to do this for a single socket?
 fn fetch_sock_info(pid: u64) -> Result<HashMap<u64, SockInfo>, Box<Error>> {
     let file = File::open(format!("/proc/{}/net/unix", pid)).unwrap();
     let mut sockets = BufReader::new(file)
@@ -699,6 +702,27 @@ fn fetch_sock_info(pid: u64) -> Result<HashMap<u64, SockInfo>, Box<Error>> {
                   (inode, sock_info)
               }).collect::<HashMap<_,_>>();
 
+    let file = File::open(format!("/proc/{}/net/netlink", pid)).unwrap();
+    let netlink_sockets = BufReader::new(file)
+        .lines()
+        .skip(1) // Header
+        .map(|line| {
+            let line = line.unwrap();
+            let fields = line.split_whitespace().collect::<Vec<&str>>();
+            let inode = fields[9].parse().unwrap();
+            let sock_info = SockInfo {
+                family: AddressFamily::Netlink,
+                sock_type: SockType::Datagram,
+                inode: inode,
+                local_addr: None,
+                peer_addr: None,
+                peer_pid: None,
+            };
+            (inode, sock_info)
+        }).collect::<HashMap<_,_>>();
+    sockets.extend(netlink_sockets);
+
+    // procfs entries for tcp, udp, and raw sockets all use same format
     let parse_file = |file, s_type| {
         BufReader::new(file)
               .lines()

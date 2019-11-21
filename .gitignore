@@ -1,3 +1,8 @@
-.idea/
 /target/
 **/*.rs.bk
+
+# Common editor/IDE files
+.idea/
+*.iml
+*.swp
+*.swo
