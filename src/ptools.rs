@@ -36,6 +36,8 @@ use std::io::{BufRead, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::str::from_utf8;
+use std::io::ErrorKind;
+use std::process::exit;
 
 // Issues blocking 0.1 release
 //  - Everything marked with BLOCKER
@@ -216,7 +218,7 @@ impl ProcStat {
             None => Err(From::from(ParseError::in_file(
                 "status",
                 &format!(
-                    "Missing expected field '{}' file {}",
+                    "Missing expected field '{}' in file {}",
                     field,
                     ProcStat::status_file(self.pid)
                 ),
@@ -234,16 +236,22 @@ fn print_tree(pid_of_interest: u64) -> Result<(), Box<Error>> {
     let mut parent_map = HashMap::new(); // Map of pid to pid of parent
 
     // Loop over all the processes listed in /proc/, find the parent of each one, and build a map
-    // from parent to children. There doesn't seem to be more efficient way of doing this reliably.
+    // from parent to children. There doesn't seem to be a more efficient way of doing this
+    // reliably.
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
         let filename = entry.file_name();
         let filename = filename.to_str().unwrap();
         if let Ok(pid) = filename.parse::<u64>() {
             let ppid = match ProcStat::read(pid) {
-                Ok(proc_stat) => proc_stat.ppid()?, // TODO should we print error and continue?
-                // TODO print error before continuing unless err is file not found, which could
-                // happen if proc exited
+                Ok(proc_stat) => match proc_stat.ppid() {
+                    Ok(ppid) => ppid,
+                    Err(e) => {
+                        eprintln!("{}", e.to_string());
+                        continue
+                    }
+                },
+                // Proc probably exited before we could read its status
                 Err(_) => continue,
             };
             child_map.entry(ppid).or_insert(vec![]).push(pid);
@@ -254,6 +262,10 @@ fn print_tree(pid_of_interest: u64) -> Result<(), Box<Error>> {
     let indent_level = if pid_of_interest == 1 {
         0
     } else {
+        if !parent_map.contains_key(&pid_of_interest) {
+            eprintln!("No such pid {}", pid_of_interest);
+            exit(1);
+        }
         print_parents(&parent_map, pid_of_interest)
     };
     print_children(&child_map, pid_of_interest, indent_level);
@@ -263,18 +275,34 @@ fn print_tree(pid_of_interest: u64) -> Result<(), Box<Error>> {
 
 // Print a summary of command line arguments on a single line.
 fn print_cmd_summary(pid: u64) {
-    let file = File::open(format!("/proc/{}/cmdline", pid)).unwrap();
-    for arg in BufReader::new(file).take(80).split('\0' as u8) {
-        print!("{} ", from_utf8(&arg.unwrap()).unwrap());
+    match File::open(format!("/proc/{}/cmdline", pid)) {
+        Ok(file) => {
+            for arg in BufReader::new(file).take(80).split('\0' as u8) {
+                print!("{} ", from_utf8(&arg.unwrap()).unwrap());
+            }
+            print!("\n");
+        }
+        Err(ref e) if e.kind() == ErrorKind::NotFound => {
+            println!("<exited>");
+        }
+        Err(e) => {
+            println!("<error reading cmdline>");
+            eprintln!("{}", e.to_string());
+        }
     }
-    print!("\n");
 }
 
 // Returns the current indentation level
 fn print_parents(parent_map: &HashMap<u64, u64>, pid: u64) -> u64 {
-    // TODO need to handle the case where the parent exited before we could read the parent's
-    // parent.
-    let ppid = *parent_map.get(&pid).unwrap();
+    let ppid = match parent_map.get(&pid) {
+        Some(ppid) => *ppid,
+        // Some child process listed 'pid' as its parent, but 'pid' exited before we could read its
+        // parent. The child of 'pid' will have been re-parented, and the new parent will be 'init'.
+        // It's actually a bit more complicated (see find_new_reaper() in the kernel), and there is
+        // one case we might want to handle better: when a child is re-parented to another thread in
+        // the thread group.
+        None => 1
+    };
 
     // We've reached the top of the process tree. Don't bother printing the parent if the parent
     // is pid 1. Typically pid 1 didn't really start the process in question.
