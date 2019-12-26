@@ -174,7 +174,7 @@ impl ProcStat {
     // can't parse this file reliably. We can read the command from /proc/[pid]/comm,
     // so we know exactly what to expect, but that would be a pain.
     //
-    fn read(pid: u64) -> Result<Self, Box<Error>> {
+    fn read(pid: u64) -> Result<Self, Box<dyn Error>> {
         // /proc/[pid]/status contains lines of the form
         //
         //    Name:   bash
@@ -200,7 +200,7 @@ impl ProcStat {
                 let key = substrs[0].to_string();
                 let value = substrs[1].trim().to_string();
                 Ok((key, value))
-            }).collect::<Result<HashMap<String, String>, Box<Error>>>()?;
+            }).collect::<Result<HashMap<String, String>, Box<dyn Error>>>()?;
 
         Ok(ProcStat {
             pid: pid,
@@ -212,7 +212,7 @@ impl ProcStat {
         format!("/proc/{}/status", pid)
     }
 
-    fn get_field(&self, field: &str) -> Result<&str, Box<Error>> {
+    fn get_field(&self, field: &str) -> Result<&str, Box<dyn Error>> {
         match self.fields.get(field) {
             Some(val) => Ok(val),
             None => Err(From::from(ParseError::in_file(
@@ -226,12 +226,12 @@ impl ProcStat {
         }
     }
 
-    fn ppid(&self) -> Result<u64, Box<Error>> {
+    fn ppid(&self) -> Result<u64, Box<dyn Error>> {
         Ok(self.get_field("PPid")?.parse()?)
     }
 }
 
-fn print_tree(pid_of_interest: u64) -> Result<(), Box<Error>> {
+fn print_tree(pid_of_interest: u64) -> Result<(), Box<dyn Error>> {
     let mut child_map = HashMap::new(); // Map of pid to pids of children
     let mut parent_map = HashMap::new(); // Map of pid to pid of parent
 
@@ -349,7 +349,6 @@ enum PosixFileType {
 // form 'anon_inode:[eventpoll]' TODO better comment
 #[derive(PartialEq)]
 enum AnonFileType {
-    Bpf,
     Epoll,
     Unknown(String),
 }
@@ -429,7 +428,6 @@ fn print_file_type(file_type: &FileType) -> String {
         FileType::Posix(PosixFileType::Fifo) => "S_IFIFO".into(),
         FileType::Posix(PosixFileType::Unknown(x)) => format!("UNKNOWN_TYPE(mode={})", x),
         FileType::Anon(AnonFileType::Epoll) => "anon_inode(epoll)".into(),
-        FileType::Anon(AnonFileType::Bpf) => "anon_inode(bpf)".into(),
         FileType::Anon(AnonFileType::Unknown(s)) => format!("anon_inode({})", s),
         FileType::Unknown => "UNKNOWN_TYPE".into(),
     }
@@ -547,22 +545,6 @@ fn print_file(pid: u64, fd: u64, sockets: &HashMap<u64, SockInfo>) {
             print!("       {}\n", path.to_str().unwrap());
         }
     }
-}
-
-// Corresponds to definitions in include/net/tcp_states.h in the kernel
-enum TcpSockState {
-    Established = 1,
-    SynSent,
-    SynRecv,
-    FinWait1,
-    FinWait2,
-    TimeWait,
-    Close,
-    CloseWait,
-    LastAck,
-    Listen,
-    Closing,
-    NewSynRecv,
 }
 
 #[derive(Debug)]
@@ -710,7 +692,7 @@ fn parse_ipv4_sock_addr(s: &str) -> Result<SocketAddr, ParseError> {
     Ok(SocketAddr::new(IpAddr::V4(addr), port))
 }
 
-fn fetch_sock_info(pid: u64) -> Result<HashMap<u64, SockInfo>, Box<Error>> {
+fn fetch_sock_info(pid: u64) -> Result<HashMap<u64, SockInfo>, Box<dyn Error>> {
     let file = File::open(format!("/proc/{}/net/unix", pid)).unwrap();
     let mut sockets = BufReader::new(file)
               .lines()
@@ -984,6 +966,7 @@ pub fn ptree_main() {
     }
 }
 
+#[cfg(test)]
 mod test {
     use super::*;
     use std::net::SocketAddr;
