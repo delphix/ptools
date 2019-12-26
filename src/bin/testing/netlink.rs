@@ -14,7 +14,7 @@
 //   limitations under the License.
 //
 
-use nix::sys::socket::{socket, AddressFamily, SockAddr, SockType, SockFlag, bind};
+use nix::sys::socket::{AddressFamily, SockAddr, SockType, bind};
 use nix::errno::Errno;
 
 use std::fs::File;
@@ -35,7 +35,7 @@ fn main() {
 
     let fd = Errno::result(fd).unwrap();
 
-    bind(fd, &SockAddr::new_netlink(0, 0));
+    bind(fd, &SockAddr::new_netlink(0, 0)).unwrap();
 
     // Signal parent process (the test process) that this process is ready to be observed by the
     // ptool being tested.
