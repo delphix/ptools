@@ -28,6 +28,7 @@ name = "netlink_example"
 path = "src/bin/testing/netlink.rs"
 
 [profile.release]
+debug = true
 lto = true
 panic = "abort" # Save size. We don't need unwinding anyway.
 # TODO is there any way to remove the ability to display backtraces? This would
