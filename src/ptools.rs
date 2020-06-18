@@ -497,7 +497,13 @@ fn get_flags(pid: u64, fd: u64) -> u64 {
 fn print_file(pid: u64, fd: u64, sockets: &HashMap<u64, SockInfo>) {
     let link_path_str = format!("/proc/{}/fd/{}", pid, fd);
     let link_path = Path::new(&link_path_str);
-    let stat_info = stat(link_path).unwrap();
+    let stat_info = match stat(link_path) {
+        Err(e) => {
+            eprintln!("failed to stat {}: {}", &link_path_str, e);
+            return;
+        },
+        Ok(stat_info) => stat_info,
+    };
 
     let file_type = file_type(stat_info.st_mode, &link_path);
 
@@ -541,8 +547,10 @@ fn print_file(pid: u64, fd: u64, sockets: &HashMap<u64, SockInfo>) {
             }
         },
         _ => {
-            let path = fs::read_link(link_path).unwrap();
-            print!("       {}\n", path.to_str().unwrap());
+            match fs::read_link(link_path) {
+                Ok(path) => println!("       {}", path.to_string_lossy()),
+                Err(e) => eprintln!("failed to readlink {}: {}", &link_path_str, e),
+            }
         }
     }
 }
@@ -794,28 +802,41 @@ fn fetch_sock_info(pid: u64) -> Result<HashMap<u64, SockInfo>, Box<dyn Error>> {
  *           sockname: AF_INET6 ::  port: 8341
  */
 
-fn print_files(pid: u64) {
+fn print_files(pid: u64) -> bool {
+
+    let proc_dir = format!("/proc/{}/", pid);
+    if !Path::new(&proc_dir).exists() {
+        eprintln!("No such directory {}", &proc_dir);
+        return false;
+    }
+
     print_proc_summary(pid);
 
     // TODO print current rlimit
 
-    // TODO BLOCKER handle permission errors by printing an error instead of just
-    // not printing anything
-
     let sockets = fetch_sock_info(pid).unwrap();
 
-    if let Ok(entries) = fs::read_dir(format!("/proc/{}/fd/", pid)) {
+    let fd_dir = format!("/proc/{}/fd/", pid);
+    let readdir_res = fs::read_dir(&fd_dir).and_then(|entries| {
         for entry in entries {
-            let entry = entry.unwrap();
+            let entry = entry?;
             let filename = entry.file_name();
-            let filename = filename.to_str().unwrap();
-            if let Ok(fd) = filename.parse::<u64>() {
+            let filename = filename.to_string_lossy();
+            if let Ok(fd) = (&filename).parse::<u64>() {
                 print_file(pid, fd, &sockets);
             } else {
-                eprint!("Unexpected file /proc/pid/fd/{} found", filename);
+                eprint!("Unexpected file /proc/[pid]/fd/{} found", &filename);
             }
-        }
+        };
+        Ok(())
+    });
+
+    if let Err(e) = readdir_res {
+        eprintln!("Unable to read {}: {}", &fd_dir, e);
+        return false;
     }
+
+    return true;
 }
 
 pub fn pargs_main() {
@@ -923,9 +944,14 @@ pub fn pfiles_main() {
         usage_err(program, opts);
     }
 
+    let mut error = false;
     for arg in &matches.free {
         let pid = arg.parse::<u64>().unwrap();
-        print_files(pid);
+        error = error || !print_files(pid);
+    }
+
+    if error {
+        exit(1);
     }
 }
 
