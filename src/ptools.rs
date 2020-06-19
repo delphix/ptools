@@ -36,6 +36,8 @@ use std::io::{BufRead, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::str::from_utf8;
+use std::io::ErrorKind;
+use std::process::exit;
 
 // Issues blocking 0.1 release
 //  - Everything marked with BLOCKER
@@ -172,7 +174,7 @@ impl ProcStat {
     // can't parse this file reliably. We can read the command from /proc/[pid]/comm,
     // so we know exactly what to expect, but that would be a pain.
     //
-    fn read(pid: u64) -> Result<Self, Box<Error>> {
+    fn read(pid: u64) -> Result<Self, Box<dyn Error>> {
         // /proc/[pid]/status contains lines of the form
         //
         //    Name:   bash
@@ -198,7 +200,7 @@ impl ProcStat {
                 let key = substrs[0].to_string();
                 let value = substrs[1].trim().to_string();
                 Ok((key, value))
-            }).collect::<Result<HashMap<String, String>, Box<Error>>>()?;
+            }).collect::<Result<HashMap<String, String>, Box<dyn Error>>>()?;
 
         Ok(ProcStat {
             pid: pid,
@@ -210,13 +212,13 @@ impl ProcStat {
         format!("/proc/{}/status", pid)
     }
 
-    fn get_field(&self, field: &str) -> Result<&str, Box<Error>> {
+    fn get_field(&self, field: &str) -> Result<&str, Box<dyn Error>> {
         match self.fields.get(field) {
             Some(val) => Ok(val),
             None => Err(From::from(ParseError::in_file(
                 "status",
                 &format!(
-                    "Missing expected field '{}' file {}",
+                    "Missing expected field '{}' in file {}",
                     field,
                     ProcStat::status_file(self.pid)
                 ),
@@ -224,26 +226,32 @@ impl ProcStat {
         }
     }
 
-    fn ppid(&self) -> Result<u64, Box<Error>> {
+    fn ppid(&self) -> Result<u64, Box<dyn Error>> {
         Ok(self.get_field("PPid")?.parse()?)
     }
 }
 
-fn print_tree(pid_of_interest: u64) -> Result<(), Box<Error>> {
+fn print_tree(pid_of_interest: u64) -> Result<(), Box<dyn Error>> {
     let mut child_map = HashMap::new(); // Map of pid to pids of children
     let mut parent_map = HashMap::new(); // Map of pid to pid of parent
 
     // Loop over all the processes listed in /proc/, find the parent of each one, and build a map
-    // from parent to children. There doesn't seem to be more efficient way of doing this reliably.
+    // from parent to children. There doesn't seem to be a more efficient way of doing this
+    // reliably.
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
         let filename = entry.file_name();
         let filename = filename.to_str().unwrap();
         if let Ok(pid) = filename.parse::<u64>() {
             let ppid = match ProcStat::read(pid) {
-                Ok(proc_stat) => proc_stat.ppid()?, // TODO should we print error and continue?
-                // TODO print error before continuing unless err is file not found, which could
-                // happen if proc exited
+                Ok(proc_stat) => match proc_stat.ppid() {
+                    Ok(ppid) => ppid,
+                    Err(e) => {
+                        eprintln!("{}", e.to_string());
+                        continue
+                    }
+                },
+                // Proc probably exited before we could read its status
                 Err(_) => continue,
             };
             child_map.entry(ppid).or_insert(vec![]).push(pid);
@@ -254,6 +262,10 @@ fn print_tree(pid_of_interest: u64) -> Result<(), Box<Error>> {
     let indent_level = if pid_of_interest == 1 {
         0
     } else {
+        if !parent_map.contains_key(&pid_of_interest) {
+            eprintln!("No such pid {}", pid_of_interest);
+            exit(1);
+        }
         print_parents(&parent_map, pid_of_interest)
     };
     print_children(&child_map, pid_of_interest, indent_level);
@@ -263,18 +275,34 @@ fn print_tree(pid_of_interest: u64) -> Result<(), Box<Error>> {
 
 // Print a summary of command line arguments on a single line.
 fn print_cmd_summary(pid: u64) {
-    let file = File::open(format!("/proc/{}/cmdline", pid)).unwrap();
-    for arg in BufReader::new(file).take(80).split('\0' as u8) {
-        print!("{} ", from_utf8(&arg.unwrap()).unwrap());
+    match File::open(format!("/proc/{}/cmdline", pid)) {
+        Ok(file) => {
+            for arg in BufReader::new(file).take(80).split('\0' as u8) {
+                print!("{} ", from_utf8(&arg.unwrap()).unwrap());
+            }
+            print!("\n");
+        }
+        Err(ref e) if e.kind() == ErrorKind::NotFound => {
+            println!("<exited>");
+        }
+        Err(e) => {
+            println!("<error reading cmdline>");
+            eprintln!("{}", e.to_string());
+        }
     }
-    print!("\n");
 }
 
 // Returns the current indentation level
 fn print_parents(parent_map: &HashMap<u64, u64>, pid: u64) -> u64 {
-    // TODO need to handle the case where the parent exited before we could read the parent's
-    // parent.
-    let ppid = *parent_map.get(&pid).unwrap();
+    let ppid = match parent_map.get(&pid) {
+        Some(ppid) => *ppid,
+        // Some child process listed 'pid' as its parent, but 'pid' exited before we could read its
+        // parent. The child of 'pid' will have been re-parented, and the new parent will be 'init'.
+        // It's actually a bit more complicated (see find_new_reaper() in the kernel), and there is
+        // one case we might want to handle better: when a child is re-parented to another thread in
+        // the thread group.
+        None => 1
+    };
 
     // We've reached the top of the process tree. Don't bother printing the parent if the parent
     // is pid 1. Typically pid 1 didn't really start the process in question.
@@ -321,7 +349,6 @@ enum PosixFileType {
 // form 'anon_inode:[eventpoll]' TODO better comment
 #[derive(PartialEq)]
 enum AnonFileType {
-    Bpf,
     Epoll,
     Unknown(String),
 }
@@ -401,7 +428,6 @@ fn print_file_type(file_type: &FileType) -> String {
         FileType::Posix(PosixFileType::Fifo) => "S_IFIFO".into(),
         FileType::Posix(PosixFileType::Unknown(x)) => format!("UNKNOWN_TYPE(mode={})", x),
         FileType::Anon(AnonFileType::Epoll) => "anon_inode(epoll)".into(),
-        FileType::Anon(AnonFileType::Bpf) => "anon_inode(bpf)".into(),
         FileType::Anon(AnonFileType::Unknown(s)) => format!("anon_inode({})", s),
         FileType::Unknown => "UNKNOWN_TYPE".into(),
     }
@@ -471,7 +497,13 @@ fn get_flags(pid: u64, fd: u64) -> u64 {
 fn print_file(pid: u64, fd: u64, sockets: &HashMap<u64, SockInfo>) {
     let link_path_str = format!("/proc/{}/fd/{}", pid, fd);
     let link_path = Path::new(&link_path_str);
-    let stat_info = stat(link_path).unwrap();
+    let stat_info = match stat(link_path) {
+        Err(e) => {
+            eprintln!("failed to stat {}: {}", &link_path_str, e);
+            return;
+        },
+        Ok(stat_info) => stat_info,
+    };
 
     let file_type = file_type(stat_info.st_mode, &link_path);
 
@@ -515,26 +547,12 @@ fn print_file(pid: u64, fd: u64, sockets: &HashMap<u64, SockInfo>) {
             }
         },
         _ => {
-            let path = fs::read_link(link_path).unwrap();
-            print!("       {}\n", path.to_str().unwrap());
+            match fs::read_link(link_path) {
+                Ok(path) => println!("       {}", path.to_string_lossy()),
+                Err(e) => eprintln!("failed to readlink {}: {}", &link_path_str, e),
+            }
         }
     }
-}
-
-// Corresponds to definitions in include/net/tcp_states.h in the kernel
-enum TcpSockState {
-    Established = 1,
-    SynSent,
-    SynRecv,
-    FinWait1,
-    FinWait2,
-    TimeWait,
-    Close,
-    CloseWait,
-    LastAck,
-    Listen,
-    Closing,
-    NewSynRecv,
 }
 
 #[derive(Debug)]
@@ -682,7 +700,7 @@ fn parse_ipv4_sock_addr(s: &str) -> Result<SocketAddr, ParseError> {
     Ok(SocketAddr::new(IpAddr::V4(addr), port))
 }
 
-fn fetch_sock_info(pid: u64) -> Result<HashMap<u64, SockInfo>, Box<Error>> {
+fn fetch_sock_info(pid: u64) -> Result<HashMap<u64, SockInfo>, Box<dyn Error>> {
     let file = File::open(format!("/proc/{}/net/unix", pid)).unwrap();
     let mut sockets = BufReader::new(file)
               .lines()
@@ -784,28 +802,41 @@ fn fetch_sock_info(pid: u64) -> Result<HashMap<u64, SockInfo>, Box<Error>> {
  *           sockname: AF_INET6 ::  port: 8341
  */
 
-fn print_files(pid: u64) {
+fn print_files(pid: u64) -> bool {
+
+    let proc_dir = format!("/proc/{}/", pid);
+    if !Path::new(&proc_dir).exists() {
+        eprintln!("No such directory {}", &proc_dir);
+        return false;
+    }
+
     print_proc_summary(pid);
 
     // TODO print current rlimit
 
-    // TODO BLOCKER handle permission errors by printing an error instead of just
-    // not printing anything
-
     let sockets = fetch_sock_info(pid).unwrap();
 
-    if let Ok(entries) = fs::read_dir(format!("/proc/{}/fd/", pid)) {
+    let fd_dir = format!("/proc/{}/fd/", pid);
+    let readdir_res = fs::read_dir(&fd_dir).and_then(|entries| {
         for entry in entries {
-            let entry = entry.unwrap();
+            let entry = entry?;
             let filename = entry.file_name();
-            let filename = filename.to_str().unwrap();
-            if let Ok(fd) = filename.parse::<u64>() {
+            let filename = filename.to_string_lossy();
+            if let Ok(fd) = (&filename).parse::<u64>() {
                 print_file(pid, fd, &sockets);
             } else {
-                eprint!("Unexpected file /proc/pid/fd/{} found", filename);
+                eprint!("Unexpected file /proc/[pid]/fd/{} found", &filename);
             }
-        }
+        };
+        Ok(())
+    });
+
+    if let Err(e) = readdir_res {
+        eprintln!("Unable to read {}: {}", &fd_dir, e);
+        return false;
     }
+
+    return true;
 }
 
 pub fn pargs_main() {
@@ -913,9 +944,14 @@ pub fn pfiles_main() {
         usage_err(program, opts);
     }
 
+    let mut error = false;
     for arg in &matches.free {
         let pid = arg.parse::<u64>().unwrap();
-        print_files(pid);
+        error = error || !print_files(pid);
+    }
+
+    if error {
+        exit(1);
     }
 }
 
@@ -956,6 +992,7 @@ pub fn ptree_main() {
     }
 }
 
+#[cfg(test)]
 mod test {
     use super::*;
     use std::net::SocketAddr;
