@@ -26,7 +26,7 @@ extern crate nix;
 use getopts::{Options, ParsingStyle};
 
 use nix::fcntl::OFlag;
-use nix::sys::socket::{AddressFamily, SockType};
+use nix::sys::socket::AddressFamily;
 use nix::sys::stat::{major, minor, stat, SFlag};
 use std::collections::HashMap;
 use std::env;
@@ -34,8 +34,8 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::ParseIntError;
 use std::path::Path;
-use std::str::from_utf8;
 use std::io::ErrorKind;
 use std::process::exit;
 
@@ -83,24 +83,29 @@ fn usage_impl(program: &str, opts: Options, error: bool) -> ! {
     std::process::exit(if error { 1 } else { 0 });
 }
 
-fn open_or_exit(filename: &str) -> File {
+fn open_or_warn(filename: &str) -> Option<File> {
     match File::open(filename) {
-        Ok(f) => f,
+        Ok(file) => Some(file),
         Err(e) => {
-            eprint!("{} {}\n", filename, e);
-            std::process::exit(1);
+            eprintln!("Error opening {}: {}", filename, e);
+            None
         }
     }
 }
 
 fn print_args(pid: u64) {
-    let file = open_or_exit(&format!("/proc/{}/cmdline", pid));
-    print_proc_summary(pid);
+    if let Some(file) = open_or_warn(&format!("/proc/{}/cmdline", pid)) {
+        print_proc_summary(pid);
 
-    for (i, bytes) in BufReader::new(file).split('\0' as u8).enumerate() {
-        let bytes = &bytes.unwrap();
-        let arg = from_utf8(bytes).unwrap();
-        println!("argv[{}]: {}", i, arg);
+        for (i, bytes) in BufReader::new(file).split('\0' as u8).enumerate() {
+            match &bytes {
+                Ok(bytes) => {
+                    let arg = String::from_utf8_lossy(bytes);
+                    println!("argv[{}]: {}", i, arg);
+                }
+                Err(e) => { eprint!("Error reading args: {}", e)}
+            }
+        }
     }
 }
 
@@ -113,13 +118,18 @@ fn print_env(pid: u64) {
     //
     // Long term, we might want to print the current environment if we can, and print a warning
     // + the contents of /proc/[pid]/environ if we can't
-    let file = open_or_exit(&format!("/proc/{}/environ", pid));
-    print_proc_summary(pid);
+    if let Some(file) = open_or_warn(&format!("/proc/{}/environ", pid)) {
+        print_proc_summary(pid);
 
-    for (i, bytes) in BufReader::new(file).split('\0' as u8).enumerate() {
-        let bytes = &bytes.unwrap();
-        let arg = from_utf8(bytes).unwrap();
-        println!("envp[{}]: {}", i, arg);
+        for (i, bytes) in BufReader::new(file).split('\0' as u8).enumerate() {
+            match &bytes {
+                Ok(bytes) => {
+                    let arg = String::from_utf8_lossy(bytes);
+                    println!("envp[{}]: {}", i, arg);
+                }
+                Err(e) => { eprint!("Error reading environment: {}", e)}
+            }
+        }
     }
 }
 
@@ -231,18 +241,18 @@ impl ProcStat {
     }
 }
 
-fn print_tree(pid_of_interest: u64) -> Result<(), Box<dyn Error>> {
+
+// Loop over all the processes listed in /proc/, find the parent of each one, and build a map from
+// child to parent and a map from parent to children. There doesn't seem to be a more efficient way
+// of doing this reliably.
+fn build_proc_maps() -> Result<(HashMap<u64, u64>, HashMap<u64, Vec<u64>>), Box<dyn Error>> {
     let mut child_map = HashMap::new(); // Map of pid to pids of children
     let mut parent_map = HashMap::new(); // Map of pid to pid of parent
 
-    // Loop over all the processes listed in /proc/, find the parent of each one, and build a map
-    // from parent to children. There doesn't seem to be a more efficient way of doing this
-    // reliably.
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
         let filename = entry.file_name();
-        let filename = filename.to_str().unwrap();
-        if let Ok(pid) = filename.parse::<u64>() {
+        if let Some(pid) = filename.to_str().and_then(|s| s.parse::<u64>().ok()) {
             let ppid = match ProcStat::read(pid) {
                 Ok(proc_stat) => match proc_stat.ppid() {
                     Ok(ppid) => ppid,
@@ -259,18 +269,20 @@ fn print_tree(pid_of_interest: u64) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let indent_level = if pid_of_interest == 1 {
+    Ok((parent_map, child_map))
+}
+
+fn print_tree(pid: u64, parent_map: &HashMap<u64, u64>, child_map: &HashMap<u64, Vec<u64>>) {
+    let indent_level = if pid == 1 {
         0
     } else {
-        if !parent_map.contains_key(&pid_of_interest) {
-            eprintln!("No such pid {}", pid_of_interest);
-            exit(1);
+        if !parent_map.contains_key(&pid) {
+            eprintln!("No such pid {}", pid);
+            return;
         }
-        print_parents(&parent_map, pid_of_interest)
+        print_parents(&parent_map, pid)
     };
-    print_children(&child_map, pid_of_interest, indent_level);
-
-    Ok(())
+    print_children(&child_map, pid, indent_level);
 }
 
 // Print a summary of command line arguments on a single line.
@@ -278,7 +290,14 @@ fn print_cmd_summary(pid: u64) {
     match File::open(format!("/proc/{}/cmdline", pid)) {
         Ok(file) => {
             for arg in BufReader::new(file).take(80).split('\0' as u8) {
-                print!("{} ", from_utf8(&arg.unwrap()).unwrap());
+                match arg {
+                    Ok(arg) => print!("{} ", String::from_utf8_lossy(&arg)),
+                    Err(e) => {
+                        println!("<error reading cmdline>");
+                        eprintln!("{}", e.to_string());
+                        break;
+                    }
+                }
             }
             print!("\n");
         }
@@ -358,6 +377,20 @@ enum FileType {
     Posix(PosixFileType),
     Anon(AnonFileType),
     Unknown,
+}
+
+// We define our own enum rather than using the one from nix so that we can include additional
+// types defined by the linux kernel but not by nix.
+#[derive(Copy, Clone)]
+enum SockType {
+    Stream,
+    Datagram,
+    Raw,
+    Rdm,
+    SeqPacket,
+    Dccp,
+    Packet,
+    Unknown(u16)
 }
 
 // Some common types of files have their type described by the st_mode returned by stat. For certain
@@ -478,20 +511,18 @@ fn print_open_flags(flags: u64) {
     print!("\n");
 }
 
-fn get_flags(pid: u64, fd: u64) -> u64 {
+fn get_flags(pid: u64, fd: u64) -> Result<u64, Box<dyn Error>> {
     let mut contents = String::new();
-    File::open(format!("/proc/{}/fdinfo/{}", pid, fd))
-        .unwrap()
-        .read_to_string(&mut contents)
-        .unwrap();
+    File::open(format!("/proc/{}/fdinfo/{}", pid, fd))?
+        .read_to_string(&mut contents)?;
     let line = contents
         .lines()
         .filter(|line| line.starts_with("flags:"))
         .collect::<Vec<&str>>()
         .pop()
-        .unwrap();
+        .ok_or(ParseError::in_file("fdinfo", "no value 'flags'"))?;
     let str_flags = line.replace("flags:", "");
-    u64::from_str_radix(str_flags.trim(), 8).unwrap()
+    Ok(u64::from_str_radix(str_flags.trim(), 8)?)
 }
 
 fn print_file(pid: u64, fd: u64, sockets: &HashMap<u64, SockInfo>) {
@@ -528,7 +559,10 @@ fn print_file(pid: u64, fd: u64, sockets: &HashMap<u64, SockInfo>) {
     }
 
     print!("       ");
-    print_open_flags(get_flags(pid, fd));
+    match get_flags(pid, fd) {
+        Ok(flags) => print_open_flags(flags),
+        Err(e) => eprintln!("failed to read fd flags: {}", e),
+    }
 
     // TODO we can print more specific information for epoll fds by looking at /proc/[pid]/fdinfo/[fd]
     match file_type {
@@ -539,7 +573,7 @@ fn print_file(pid: u64, fd: u64, sockets: &HashMap<u64, SockInfo>) {
             // TODO make sure we are displaying information that is for the correct namespace
             // TODO handle IPv6
             if let Some(sock_info) = sockets.get(&stat_info.st_ino) {
-                print_sock_type(sock_info.sock_type);
+                print_sock_type(&sock_info.sock_type);
                 print_sock_address(&sock_info);
             } else {
                 print!("       ERROR: failed to find info for socket with inode num {}\n",
@@ -555,7 +589,6 @@ fn print_file(pid: u64, fd: u64, sockets: &HashMap<u64, SockInfo>) {
     }
 }
 
-#[derive(Debug)]
 struct SockInfo {
     family: AddressFamily,
     sock_type: SockType,
@@ -566,15 +599,18 @@ struct SockInfo {
                                     // TODO state: Option<SockState>, // TCP only
 }
 
-fn print_sock_type(sock_type: SockType) {
+fn print_sock_type(sock_type: &SockType) {
     println!(
         "         {}",
         match sock_type {
-            SockType::Stream => "SOCK_STREAM",
-            SockType::Datagram => "SOCK_DGRAM",
-            SockType::SeqPacket => "SOCK_SEQPACKET",
-            SockType::Raw => "SOCK_RAW",
-            SockType::Rdm => "SOCK_RDM",
+            SockType::Stream => "SOCK_STREAM".into(),
+            SockType::Datagram => "SOCK_DGRAM".into(),
+            SockType::Raw => "SOCK_RAW".into(),
+            SockType::Rdm => "SOCK_RDM".into(),
+            SockType::SeqPacket => "SOCK_SEQPACKET".into(),
+            SockType::Dccp => "SOCK_DCCP".into(),
+            SockType::Packet => "SOCK_PACKET".into(),
+            SockType::Unknown(n) => format!("SOCK_TYPE_UNKNOWN_{}", n),
         }
     )
 }
@@ -621,7 +657,7 @@ fn address_family_str(addr_fam: AddressFamily) -> &'static str {
         AddressFamily::Caif => "AF_CAIF",
         AddressFamily::Nfc => "AF_NFC",
         AddressFamily::Vsock => "AF_VSOCK",
-        AddressFamily::Unspec => panic!("Need to handle this case"), // TODO
+        AddressFamily::Unspec => "AF_UNSPEC",
     }
 }
 
@@ -665,14 +701,17 @@ fn print_sock_address(sock_info: &SockInfo) {
     // see if we can find and print the pid/comm of the other process
 }
 
-// TODO handle case where doesn't match
-fn parse_sock_type(type_code: &str) -> SockType {
-    match type_code.parse::<u64>().unwrap() {
+fn parse_sock_type(type_code: &str) -> Result<SockType, ParseIntError> {
+    Ok(match type_code.parse::<u16>()? {
         1 => SockType::Stream,
         2 => SockType::Datagram,
+        3 => SockType::Raw,
+        4 => SockType::Rdm,
         5 => SockType::SeqPacket,
-        _ => panic!("unknown type"), // TODO
-    }
+        6 => SockType::Dccp,
+        10 => SockType::Packet,
+        n => SockType::Unknown(n),
+    })
 }
 
 // Parse a socket address of the form "0100007F:1538" (i.e. 127.0.0.1:5432)
@@ -700,82 +739,94 @@ fn parse_ipv4_sock_addr(s: &str) -> Result<SocketAddr, ParseError> {
     Ok(SocketAddr::new(IpAddr::V4(addr), port))
 }
 
-fn fetch_sock_info(pid: u64) -> Result<HashMap<u64, SockInfo>, Box<dyn Error>> {
-    let file = File::open(format!("/proc/{}/net/unix", pid)).unwrap();
-    let mut sockets = BufReader::new(file)
-              .lines()
-              .skip(1) // Header
-              .map(|line| {
-                  let line = line.unwrap();
-                  let fields = line.split_whitespace().collect::<Vec<&str>>();
-                  let inode = fields[6].parse().unwrap();
-                  let sock_info = SockInfo {
-                      family: AddressFamily::Unix,
-                      sock_type: parse_sock_type(fields[4]),
-                      inode: inode,
-                      local_addr: None,
-                      peer_addr: None,
-                      peer_pid: None,
-                  };
-                  (inode, sock_info)
-              }).collect::<HashMap<_,_>>();
+// Turn a Result into an Option, printing an error message indicating the error and the file where
+// it occurred if the value is an Err.
+fn ok_or_eprint<T>(r: Result<T, Box<dyn Error>>, filename: &str) -> Option<T> {
+    if let Err(ref e) = r {
+        eprintln!("Error parsing /proc/[pid]/net/{}: {}", filename, e)
+    }
+    r.ok()
+}
 
-    let file = File::open(format!("/proc/{}/net/netlink", pid)).unwrap();
-    let netlink_sockets = BufReader::new(file)
-        .lines()
-        .skip(1) // Header
-        .map(|line| {
-            let line = line.unwrap();
-            let fields = line.split_whitespace().collect::<Vec<&str>>();
-            let inode = fields[9].parse().unwrap();
-            let sock_info = SockInfo {
-                family: AddressFamily::Netlink,
-                sock_type: SockType::Datagram,
-                inode: inode,
-                local_addr: None,
-                peer_addr: None,
-                peer_pid: None,
-            };
-            (inode, sock_info)
-        }).collect::<HashMap<_,_>>();
-    sockets.extend(netlink_sockets);
+// Parse the info for each socket in the system from /proc/[pid]/net, and return it as a map indexed
+// by inode
+fn fetch_sock_info(pid: u64) -> HashMap<u64, SockInfo> {
+    let mut sockets = HashMap::new();
+    let filename = format!("/proc/{}/net/unix", pid);
+    if let Some(file) = open_or_warn(&filename) {
+        let unix_sockets = BufReader::new(file)
+            .lines()
+            .skip(1) // Header
+            .map(|line| {
+                let line = line?;
+                let fields = line.split_whitespace().collect::<Vec<&str>>();
+                let inode = fields[6].parse()?;
+                let sock_info = SockInfo {
+                    family: AddressFamily::Unix,
+                    sock_type: parse_sock_type(fields[4])?,
+                    inode: inode,
+                    local_addr: None,
+                    peer_addr: None,
+                    peer_pid: None,
+                };
+                Ok((inode, sock_info))
+            })
+            .filter_map(|sock_info| ok_or_eprint(sock_info, "unix"));
+        sockets.extend(unix_sockets);
+    }
+
+    if let Some(file) = open_or_warn(&format!("/proc/{}/net/netlink", pid)) {
+        let netlink_sockets = BufReader::new(file)
+            .lines()
+            .skip(1) // Header
+            .map(|line| {
+                let line = line?;
+                let fields = line.split_whitespace().collect::<Vec<&str>>();
+                let inode = fields[9].parse()?;
+                let sock_info = SockInfo {
+                    family: AddressFamily::Netlink,
+                    sock_type: SockType::Datagram,
+                    inode: inode,
+                    local_addr: None,
+                    peer_addr: None,
+                    peer_pid: None,
+                };
+                Ok((inode, sock_info))
+            })
+            .filter_map(|sock_info| ok_or_eprint(sock_info, "netlink"));
+        sockets.extend(netlink_sockets);
+    }
 
     // procfs entries for tcp, udp, and raw sockets all use same format
-    let parse_file = |file, s_type| {
-        BufReader::new(file)
-              .lines()
-              .skip(1) // Header
-              .map(|line| {
-                  let line = line.unwrap();
-                  let fields = line.split_whitespace().collect::<Vec<&str>>();
-                  let inode = fields[9].parse().unwrap();
-                  let sock_info = SockInfo {
-                      family: AddressFamily::Inet,
-                      sock_type: s_type,
-                      local_addr: Some(parse_ipv4_sock_addr(fields[1]).unwrap()),
-                      peer_addr: Some(parse_ipv4_sock_addr(fields[2]).unwrap()),
-                      peer_pid: None,
-                      //state: u64::from_str_radix(fields[3], 16).unwrap(),
-                      inode: inode,
-                  };
-                  (inode, sock_info)
-              }).collect::<Vec<_>>().into_iter() // TODO the collect().into_iter() is obviously bad
+    let mut parse_file = |filename, s_type| {
+        if let Some(file) = open_or_warn(&format!("/proc/{}/net/{}", pid, filename)) {
+            let additional_sockets = BufReader::new(file)
+                .lines()
+                .skip(1) // Header
+                .map(move |line| {
+                    let line = line?;
+                    let fields = line.split_whitespace().collect::<Vec<&str>>();
+                    let inode = fields[9].parse()?;
+                    let sock_info = SockInfo {
+                        family: AddressFamily::Inet,
+                        sock_type: s_type,
+                        local_addr: Some(parse_ipv4_sock_addr(fields[1])?),
+                        peer_addr: Some(parse_ipv4_sock_addr(fields[2])?),
+                        peer_pid: None,
+                        inode: inode,
+                    };
+                    Ok((inode, sock_info))
+                })
+                .filter_map(|sock_info| ok_or_eprint(sock_info, filename));
+            sockets.extend(additional_sockets);
+        }
     };
 
-    sockets.extend(parse_file(
-        File::open(format!("/proc/{}/net/tcp", pid)).unwrap(),
-        SockType::Stream,
-    ));
-    sockets.extend(parse_file(
-        File::open(format!("/proc/{}/net/udp", pid)).unwrap(),
-        SockType::Datagram,
-    ));
-    sockets.extend(parse_file(
-        File::open(format!("/proc/{}/net/raw", pid)).unwrap(),
-        SockType::Raw,
-    ));
+    parse_file("tcp", SockType::Stream);
+    parse_file("udp", SockType::Datagram);
+    parse_file("raw", SockType::Raw);
 
-    Ok(sockets)
+    sockets
 }
 
 /*
@@ -814,7 +865,7 @@ fn print_files(pid: u64) -> bool {
 
     // TODO print current rlimit
 
-    let sockets = fetch_sock_info(pid).unwrap();
+    let sockets = fetch_sock_info(pid);
 
     let fd_dir = format!("/proc/{}/fd/", pid);
     let readdir_res = fs::read_dir(&fd_dir).and_then(|entries| {
@@ -837,6 +888,16 @@ fn print_files(pid: u64) -> bool {
     }
 
     return true;
+}
+
+fn parse_pid(arg: &str) -> Option<u64> {
+    match arg.parse::<u64>() {
+        Ok(pid) => Some(pid),
+        Err(_e) => {
+            eprintln!("'{}' is not a valid PID", arg);
+            None
+        }
+    }
 }
 
 pub fn pargs_main() {
@@ -873,13 +934,14 @@ pub fn pargs_main() {
     let do_print_env = matches.opt_present("e");
 
     for arg in &matches.free {
-        let pid = arg.parse::<u64>().unwrap();
-        if do_print_args || !do_print_env {
-            print_args(pid);
-        }
+        if let Some(pid) = parse_pid(arg) {
+            if do_print_args || !do_print_env {
+                print_args(pid);
+            }
 
-        if do_print_env {
-            print_env(pid);
+            if do_print_env {
+                print_env(pid);
+            }
         }
     }
 }
@@ -912,8 +974,9 @@ pub fn penv_main() {
     }
 
     for arg in &matches.free {
-        let pid = arg.parse::<u64>().unwrap();
-        print_env(pid);
+        if let Some(pid) = parse_pid(arg) {
+            print_env(pid);
+        }
     }
 }
 
@@ -946,8 +1009,9 @@ pub fn pfiles_main() {
 
     let mut error = false;
     for arg in &matches.free {
-        let pid = arg.parse::<u64>().unwrap();
-        error = error || !print_files(pid);
+        if let Some(pid) = parse_pid(arg) {
+            error = error || !print_files(pid);
+        }
     }
 
     if error {
@@ -978,16 +1042,23 @@ pub fn ptree_main() {
         usage(program, opts);
     }
 
+    let (parent_map, child_map) = match build_proc_maps() {
+        Ok(maps) => maps,
+        Err(e) => {
+            eprintln!("Error building parent/child maps: {}", e);
+            exit(1);
+        }
+    };
+
     if matches.free.len() == 0 {
         // Should we print all processes here, including kernel threads? Is there any way this
         // could miss userspace processes?
-        print_tree(1).unwrap();
+        print_tree(1, &parent_map, &child_map);
     } else {
-        // This loop parses /proc/<pid>/status for each process in the system for each
-        // argument provided. Should rearrange it so it's only parsed once.
         for arg in &matches.free {
-            let pid = arg.parse::<u64>().unwrap();
-            print_tree(pid).unwrap();
+            if let Some(pid) = parse_pid(arg) {
+                print_tree(pid, &parent_map, &child_map);
+            }
         }
     }
 }
