@@ -2,6 +2,9 @@
 name = "ptools"
 version = "0.1.0"
 authors = ["John Gallagher"]
+license = "Apache-2.0"
+description = "Utilities for inspecting Linux processes"
+readme = "README.md"
 
 [lib]
 name = "ptools"
@@ -41,6 +44,15 @@ nix = "0.12.0"
 libc = "0.2.48"
 
 [package.metadata.deb]
+maintainer = "Delphix Engineering <eng@delphix.com>"
+section = "debug"
+copyright = "2018, 2020 Delphix"
+
+extended-description = """\
+A collection of utilities for inspecting the state of processes, modeled \
+after the tools by the same name which exist on Solaris/Illumos."""
+
+separate-debug-symbols = true
 assets = [
   # List files we want explicitly so that we don't get the binaries intended for
   # testing.
