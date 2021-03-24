@@ -572,7 +572,7 @@ fn print_file(pid: u64, fd: u64, sockets: &HashMap<u64, SockInfo>) {
             // any info for the socket in procfs.
             // TODO make sure we are displaying information that is for the correct namespace
             // TODO handle IPv6
-            if let Some(sock_info) = sockets.get(&stat_info.st_ino) {
+            if let Some(sock_info) = sockets.get(&(stat_info.st_ino as u64)) {
                 print_sock_type(&sock_info.sock_type);
                 print_sock_address(&sock_info);
             } else {
