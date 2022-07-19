@@ -21,7 +21,7 @@ jobs:
           version=${gh_tag#refs/tags/v}
           echo "Working with version $version"
           grep -q "version = \"$version\"" Cargo.toml || { echo "Version mismatch"; exit 1; }
-          echo "::set-env name=DEB_PKG_NAME::ptools_${version}_amd64.deb"
+          echo "DEB_PKG_NAME=ptools_${version}_amd64.deb" >> $GITHUB_ENV
       - name: Install cargo-deb
         run: cargo install cargo-deb --version 1.27.0
       - name: Build package
