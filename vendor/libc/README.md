@@ -1,173 +1,101 @@
-libc
-====
+# libc - Raw FFI bindings to platforms' system libraries
 
-Raw FFI bindings to platform libraries like `libc`.
+[![GHA Status]][GitHub Actions] [![Latest Version]][crates.io] [![Documentation]][docs.rs] ![License]
 
-[![Build Status](https://travis-ci.org/rust-lang/libc.svg?branch=master)](https://travis-ci.org/rust-lang/libc)
-[![Build status](https://ci.appveyor.com/api/projects/status/github/rust-lang/libc?svg=true)](https://ci.appveyor.com/project/rust-lang-libs/libc)
-[![Build Status](https://api.cirrus-ci.com/github/rust-lang/libc.svg)](https://cirrus-ci.com/github/rust-lang/libc)
-[![Latest version](https://img.shields.io/crates/v/libc.svg)](https://crates.io/crates/libc)
-[![Documentation](https://docs.rs/libc/badge.svg)](https://docs.rs/libc)
-![License](https://img.shields.io/crates/l/libc.svg)
+`libc` provides all of the definitions necessary to easily interoperate with C
+code (or "C-like" code) on each of the platforms that Rust supports. This
+includes type definitions (e.g. `c_int`), constants (e.g. `EINVAL`) as well as
+function headers (e.g. `malloc`).
+
+This crate exports all underlying platform types, functions, and constants under
+the crate root, so all items are accessible as `libc::foo`. The types and values
+of all the exported APIs match the platform that libc is compiled for.
+
+Windows API bindings are not included in this crate. If you are looking for
+WinAPI bindings, consider using crates like [windows-sys].
+
+More detailed information about the design of this library can be found in its
+[associated RFC][rfc].
+
+[rfc]: https://github.com/rust-lang/rfcs/blob/HEAD/text/1291-promote-libc.md
+[windows-sys]: https://docs.rs/windows-sys
+
+## v1.0 Roadmap
+
+Currently, `libc` has two active branches: `main` for the upcoming v1.0 release,
+and `libc-0.2` for the currently published version. By default all pull requests
+should target `main`; once reviewed, they can be cherry picked to the `libc-0.2`
+branch if needed.
+
+We will stop making new v0.2 releases once v1.0 is released.
+
+See the section in [CONTRIBUTING.md](CONTRIBUTING.md#v10-roadmap) for more
+details.
 
 ## Usage
 
-First, add the following to your `Cargo.toml`:
+Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
 libc = "0.2"
 ```
 
-Next, add this to your crate root:
+## Rust version support
 
-```rust
-extern crate libc;
-```
+The minimum supported Rust toolchain version is currently **Rust 1.65**.
 
-Currently libc by default links to the standard library, but if you would
-instead like to use libc in a `#![no_std]` situation or crate you can request
-this via:
+Increases to the MSRV are allowed to change without a major (i.e. semver-
+breaking) release in order to avoid a ripple effect in the ecosystem. A policy
+for when this may change is a work in progress.
 
-```toml
-[dependencies]
-libc = { version = "0.2", default-features = false }
-```
+`libc` may continue to compile with Rust versions older than the current MSRV
+but this is not guaranteed.
 
-By default libc uses private fields in structs in order to enforce a certain
-memory alignment on them. These structs can be hard to instantiate outside of
-libc. To make libc use `#[repr(align(x))]`, instead of the private fields,
-activate the *align* feature. This requires Rust 1.25 or newer:
+## Platform support
 
-```toml
-[dependencies]
-libc = { version = "0.2", features = ["align"] }
-```
+You can see the platform(target)-specific docs on [docs.rs], select a platform
+you want to see.
 
-## What is libc?
+See [`ci/verify-build.py`](https://github.com/rust-lang/libc/blob/HEAD/ci/verify-build.py) for
+the platforms on which `libc` is guaranteed to build for each Rust toolchain.
+The test matrices at [GitHub Actions] show the platforms in which `libc` tests
+are run.
 
-The primary purpose of this crate is to provide all of the definitions necessary
-to easily interoperate with C code (or "C-like" code) on each of the platforms
-that Rust supports. This includes type definitions (e.g. `c_int`), constants
-(e.g. `EINVAL`) as well as function headers (e.g. `malloc`).
+<div class="platform_docs"></div>
 
-This crate does not strive to have any form of compatibility across platforms,
-but rather it is simply a straight binding to the system libraries on the
-platform in question.
+## License
 
-## Public API
+This project is licensed under either of
 
-This crate exports all underlying platform types, functions, and constants under
-the crate root, so all items are accessible as `libc::foo`. The types and values
-of all the exported APIs match the platform that libc is compiled for.
+* [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+  ([LICENSE-APACHE](https://github.com/rust-lang/libc/blob/HEAD/LICENSE-APACHE))
 
-More detailed information about the design of this library can be found in its
-[associated RFC][rfc].
+* [MIT License](https://opensource.org/licenses/MIT)
+  ([LICENSE-MIT](https://github.com/rust-lang/libc/blob/HEAD/LICENSE-MIT))
 
-[rfc]: https://github.com/rust-lang/rfcs/blob/master/text/1291-promote-libc.md
+at your option.
 
-## Adding an API
+## Contributing
 
-Want to use an API which currently isn't bound in `libc`? It's quite easy to add
-one!
+We welcome all people who want to contribute. Please see the
+[contributing instructions] for more information.
 
-The internal structure of this crate is designed to minimize the number of
-`#[cfg]` attributes in order to easily be able to add new items which apply
-to all platforms in the future. As a result, the crate is organized
-hierarchically based on platform. Each module has a number of `#[cfg]`'d
-children, but only one is ever actually compiled. Each module then reexports all
-the contents of its children.
+[contributing instructions]: https://github.com/rust-lang/libc/blob/HEAD/CONTRIBUTING.md
 
-This means that for each platform that libc supports, the path from a
-leaf module to the root will contain all bindings for the platform in question.
-Consequently, this indicates where an API should be added! Adding an API at a
-particular level in the hierarchy means that it is supported on all the child
-platforms of that level. For example, when adding a Unix API it should be added
-to `src/unix/mod.rs`, but when adding a Linux-only API it should be added to
-`src/unix/notbsd/linux/mod.rs`.
+Contributions in any form (issues, pull requests, etc.) to this project must
+adhere to Rust's [Code of Conduct].
 
-If you're not 100% sure at what level of the hierarchy an API should be added
-at, fear not! This crate has CI support which tests any binding against all
-platforms supported, so you'll see failures if an API is added at the wrong
-level or has different signatures across platforms.
+[Code of Conduct]: https://www.rust-lang.org/policies/code-of-conduct
 
-With that in mind, the steps for adding a new API are:
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in `libc` by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
 
-1. Determine where in the module hierarchy your API should be added.
-2. Add the API.
-3. Send a PR to this repo.
-4. Wait for CI to pass, fixing errors.
-5. Wait for a merge!
-
-### Test before you commit
-
-We have two automated tests running on [Travis](https://travis-ci.org/rust-lang/libc):
-
-1. [`libc-test`](https://github.com/alexcrichton/ctest)
-  - `cd libc-test && cargo test`
-  - Use the `skip_*()` functions in `build.rs` if you really need a workaround.
-2. Style checker
-  - `rustc ci/style.rs && ./style src`
-
-### Releasing your change to crates.io
-
-Now that you've done the amazing job of landing your new API or your new
-platform in this crate, the next step is to get that sweet, sweet usage from
-crates.io! The only next step is to bump the version of libc and then publish
-it. If you'd like to get a release out ASAP you can follow these steps:
-
-1. Update the version number in `Cargo.toml`, you'll just be bumping the patch
-   version number.
-2. Run `cargo update` to regenerate the lockfile to encode your version bump in
-   the lock file. You may pull in some other updated dependencies, that's ok.
-3. Send a PR to this repository. It should [look like this][example], but it'd
-   also be nice to fill out the description with a small rationale for the
-   release (any rationale is ok though!)
-4. Once merged the release will be tagged and published by one of the libc crate
-   maintainers.
-
-[example]: https://github.com/rust-lang/libc/pull/583
-
-## Platforms and Documentation
-
-The following platforms are currently tested and have documentation available:
-
-Tested:
-  * [`i686-pc-windows-msvc`](https://rust-lang.github.io/libc/i686-pc-windows-msvc/libc/)
-  * [`x86_64-pc-windows-msvc`](https://rust-lang.github.io/libc/x86_64-pc-windows-msvc/libc/)
-    (Windows)
-  * [`i686-pc-windows-gnu`](https://rust-lang.github.io/libc/i686-pc-windows-gnu/libc/)
-  * [`x86_64-pc-windows-gnu`](https://rust-lang.github.io/libc/x86_64-pc-windows-gnu/libc/)
-  * [`i686-apple-darwin`](https://rust-lang.github.io/libc/i686-apple-darwin/libc/)
-  * [`x86_64-apple-darwin`](https://rust-lang.github.io/libc/x86_64-apple-darwin/libc/)
-    (OSX)
-  * `i386-apple-ios`
-  * `x86_64-apple-ios`
-  * [`i686-unknown-linux-gnu`](https://rust-lang.github.io/libc/i686-unknown-linux-gnu/libc/)
-  * [`x86_64-unknown-linux-gnu`](https://rust-lang.github.io/libc/x86_64-unknown-linux-gnu/libc/)
-    (Linux)
-  * [`x86_64-unknown-linux-musl`](https://rust-lang.github.io/libc/x86_64-unknown-linux-musl/libc/)
-    (Linux MUSL)
-  * [`aarch64-unknown-linux-gnu`](https://rust-lang.github.io/libc/aarch64-unknown-linux-gnu/libc/)
-    (Linux)
-  * `aarch64-unknown-linux-musl`
-    (Linux MUSL)
-  * [`sparc64-unknown-linux-gnu`](https://rust-lang.github.io/libc/sparc64-unknown-linux-gnu/libc/)
-    (Linux)
-  * [`mips-unknown-linux-gnu`](https://rust-lang.github.io/libc/mips-unknown-linux-gnu/libc/)
-  * [`arm-unknown-linux-gnueabihf`](https://rust-lang.github.io/libc/arm-unknown-linux-gnueabihf/libc/)
-  * [`arm-linux-androideabi`](https://rust-lang.github.io/libc/arm-linux-androideabi/libc/)
-    (Android)
-  * [`x86_64-unknown-freebsd`](https://rust-lang.github.io/libc/x86_64-unknown-freebsd/libc/)
-  * [`x86_64-unknown-openbsd`](https://rust-lang.github.io/libc/x86_64-unknown-openbsd/libc/)
-  * [`x86_64-rumprun-netbsd`](https://rust-lang.github.io/libc/x86_64-unknown-netbsd/libc/)
-
-The following may be supported, but are not guaranteed to always work:
-
-  * `i686-unknown-freebsd`
-  * [`x86_64-unknown-bitrig`](https://rust-lang.github.io/libc/x86_64-unknown-bitrig/libc/)
-  * [`x86_64-unknown-dragonfly`](https://rust-lang.github.io/libc/x86_64-unknown-dragonfly/libc/)
-  * `i686-unknown-haiku`
-  * `x86_64-unknown-haiku`
-  * [`x86_64-unknown-netbsd`](https://rust-lang.github.io/libc/x86_64-unknown-netbsd/libc/)
-  * [`x86_64-sun-solaris`](https://rust-lang.github.io/libc/x86_64-sun-solaris/libc/)
+[GitHub Actions]: https://github.com/rust-lang/libc/actions
+[GHA Status]: https://github.com/rust-lang/libc/workflows/CI/badge.svg
+[crates.io]: https://crates.io/crates/libc
+[Latest Version]: https://img.shields.io/crates/v/libc.svg
+[Documentation]: https://docs.rs/libc/badge.svg
+[docs.rs]: https://docs.rs/libc
+[License]: https://img.shields.io/crates/l/libc.svg
