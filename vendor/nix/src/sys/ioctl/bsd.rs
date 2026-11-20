@@ -1,20 +1,27 @@
 /// The datatype used for the ioctl number
 #[doc(hidden)]
+#[cfg(not(target_os = "illumos"))]
 pub type ioctl_num_type = ::libc::c_ulong;
+
+#[doc(hidden)]
+#[cfg(target_os = "illumos")]
+pub type ioctl_num_type = ::libc::c_int;
+
 /// The datatype used for the 3rd argument
 #[doc(hidden)]
 pub type ioctl_param_type = ::libc::c_int;
 
 mod consts {
-    use ::sys::ioctl::ioctl_num_type;
+    use crate::sys::ioctl::ioctl_num_type;
     #[doc(hidden)]
     pub const VOID: ioctl_num_type = 0x2000_0000;
     #[doc(hidden)]
     pub const OUT: ioctl_num_type = 0x4000_0000;
     #[doc(hidden)]
+    #[allow(overflowing_literals)]
     pub const IN: ioctl_num_type = 0x8000_0000;
     #[doc(hidden)]
-    pub const INOUT: ioctl_num_type = (IN|OUT);
+    pub const INOUT: ioctl_num_type = IN|OUT;
     #[doc(hidden)]
     pub const IOCPARM_MASK: ioctl_num_type = 0x1fff;
 }
@@ -44,7 +51,7 @@ macro_rules! ioc {
 /// ioctl_write_int_bad!(kvm_create_vm, request_code_none!(KVMIO, 0x03));
 /// # fn main() {}
 /// ```
-#[macro_export]
+#[macro_export(local_inner_macros)]
 macro_rules! request_code_none {
     ($g:expr, $n:expr) => (ioc!($crate::sys::ioctl::VOID, $g, $n, 0))
 }
@@ -55,7 +62,7 @@ macro_rules! request_code_none {
 ///
 /// You should only use this macro directly if the `ioctl` you're working
 /// with is "bad" and you cannot use `ioctl_write_int!()` directly.
-#[macro_export]
+#[macro_export(local_inner_macros)]
 macro_rules! request_code_write_int {
     ($g:expr, $n:expr) => (ioc!($crate::sys::ioctl::VOID, $g, $n, ::std::mem::size_of::<$crate::libc::c_int>()))
 }
@@ -70,7 +77,7 @@ macro_rules! request_code_write_int {
 /// The read/write direction is relative to userland, so this
 /// command would be userland is reading and the kernel is
 /// writing.
-#[macro_export]
+#[macro_export(local_inner_macros)]
 macro_rules! request_code_read {
     ($g:expr, $n:expr, $len:expr) => (ioc!($crate::sys::ioctl::OUT, $g, $n, $len))
 }
@@ -85,7 +92,7 @@ macro_rules! request_code_read {
 /// The read/write direction is relative to userland, so this
 /// command would be userland is writing and the kernel is
 /// reading.
-#[macro_export]
+#[macro_export(local_inner_macros)]
 macro_rules! request_code_write {
     ($g:expr, $n:expr, $len:expr) => (ioc!($crate::sys::ioctl::IN, $g, $n, $len))
 }
@@ -96,7 +103,7 @@ macro_rules! request_code_write {
 ///
 /// You should only use this macro directly if the `ioctl` you're working
 /// with is "bad" and you cannot use `ioctl_readwrite!()` directly.
-#[macro_export]
+#[macro_export(local_inner_macros)]
 macro_rules! request_code_readwrite {
     ($g:expr, $n:expr, $len:expr) => (ioc!($crate::sys::ioctl::INOUT, $g, $n, $len))
 }

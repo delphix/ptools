@@ -658,6 +658,8 @@ fn address_family_str(addr_fam: AddressFamily) -> &'static str {
         AddressFamily::Nfc => "AF_NFC",
         AddressFamily::Vsock => "AF_VSOCK",
         AddressFamily::Unspec => "AF_UNSPEC",
+        // AddressFamily is non-exhaustive, so a wildcard arm is required.
+        _ => "AF_UNKNOWN",
     }
 }
 

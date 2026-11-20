@@ -1,37 +1,43 @@
-use dox::mem;
+use crate::prelude::*;
 
-pub type c_long = i64;
-pub type c_ulong = u64;
+pub type clock_t = i32;
+pub type wchar_t = u32;
 pub type time_t = i64;
 pub type suseconds_t = i64;
+pub type register_t = i64;
 
 s! {
-    pub struct stat {
-        pub st_dev: ::dev_t,
-        pub st_ino: ::ino_t,
-        pub st_mode: ::mode_t,
-        pub st_nlink: ::nlink_t,
-        pub st_uid: ::uid_t,
-        pub st_gid: ::gid_t,
-        pub st_rdev: ::dev_t,
-        pub st_atime: ::time_t,
-        pub st_atime_nsec: ::c_long,
-        pub st_mtime: ::time_t,
-        pub st_mtime_nsec: ::c_long,
-        pub st_ctime: ::time_t,
-        pub st_ctime_nsec: ::c_long,
-        pub st_size: ::off_t,
-        pub st_blocks: ::blkcnt_t,
-        pub st_blksize: ::blksize_t,
-        pub st_flags: ::fflags_t,
-        pub st_gen: ::uint32_t,
-        pub st_lspare: ::int32_t,
-        pub st_birthtime: ::time_t,
-        pub st_birthtime_nsec: ::c_long,
+    pub struct gpregs {
+        pub gp_x: [crate::register_t; 30],
+        pub gp_lr: crate::register_t,
+        pub gp_sp: crate::register_t,
+        pub gp_elr: crate::register_t,
+        // gp_spsr was widened for FreeBSD 14.0.  This struct layout is backwards-compatible, because
+        // FreeBSD only runs on little endian aarch64.
+        pub gp_spsr: u64,
+    }
+
+    pub struct fpregs {
+        pub fp_q: [u128; 32],
+        pub fp_sr: u32,
+        pub fp_cr: u32,
+        pub fp_flags: c_int,
+        pub fp_pad: c_int,
+    }
+
+    pub struct mcontext_t {
+        pub mc_gpregs: gpregs,
+        pub mc_fpregs: fpregs,
+        pub mc_flags: c_int,
+        pub mc_pad: c_int,
+        pub mc_spare: [u64; 8],
     }
 }
 
-// should be pub(crate), but that requires Rust 1.18.0
-#[doc(hidden)]
-pub const _ALIGNBYTES: usize = mem::size_of::<::c_longlong>() - 1;
-pub const MAP_32BIT: ::c_int = 0x00080000;
+pub(crate) const _ALIGNBYTES: usize = size_of::<c_longlong>() - 1;
+
+pub const BIOCSRTIMEOUT: c_ulong = 0x8010426d;
+pub const BIOCGRTIMEOUT: c_ulong = 0x4010426e;
+pub const MAP_32BIT: c_int = 0x00080000;
+pub const MINSIGSTKSZ: size_t = 4096; // 1024 * 4
+pub const TIOCTIMESTAMP: c_ulong = 0x40107459;

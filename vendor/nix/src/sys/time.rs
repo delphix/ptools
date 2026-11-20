@@ -1,6 +1,13 @@
 use std::{cmp, fmt, ops};
-use libc::{c_long, timespec, timeval};
+use std::time::Duration;
+use std::convert::From;
+use libc::{timespec, timeval};
+#[cfg_attr(target_env = "musl", allow(deprecated))] // https://github.com/rust-lang/libc/issues/1848
 pub use libc::{time_t, suseconds_t};
+
+pub(crate) const TIMESPEC_ZERO: libc::timespec = unsafe {
+    std::mem::transmute([0u8; std::mem::size_of::<libc::timespec>()])
+};
 
 pub trait TimeValLike: Sized {
     #[inline]
@@ -44,7 +51,7 @@ pub trait TimeValLike: Sized {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TimeSpec(timespec);
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
@@ -59,6 +66,30 @@ const TS_MAX_SECONDS: i64 = ::std::isize::MAX as i64;
 
 const TS_MIN_SECONDS: i64 = -TS_MAX_SECONDS;
 
+// x32 compatibility
+// See https://sourceware.org/bugzilla/show_bug.cgi?id=16437
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "32"))]
+type timespec_tv_nsec_t = i64;
+#[cfg(not(all(target_arch = "x86_64", target_pointer_width = "32")))]
+type timespec_tv_nsec_t = libc::c_long;
+
+impl From<timespec> for TimeSpec {
+    fn from(ts: timespec) -> Self {
+        Self(ts)
+    }
+}
+
+impl From<Duration> for TimeSpec {
+    fn from(duration: Duration) -> Self {
+        Self::from_duration(duration)
+    }
+}
+
+impl From<TimeSpec> for Duration {
+    fn from(timespec: TimeSpec) -> Self {
+        Duration::new(timespec.0.tv_sec as u64, timespec.0.tv_nsec as u32)
+    }
+}
 
 impl AsRef<timespec> for TimeSpec {
     fn as_ref(&self) -> &timespec {
@@ -66,24 +97,11 @@ impl AsRef<timespec> for TimeSpec {
     }
 }
 
-impl fmt::Debug for TimeSpec {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        fmt.debug_struct("TimeSpec")
-            .field("tv_sec", &self.tv_sec())
-            .field("tv_nsec", &self.tv_nsec())
-            .finish()
+impl AsMut<timespec> for TimeSpec {
+    fn as_mut(&mut self) -> &mut timespec {
+        &mut self.0
     }
 }
-
-impl PartialEq for TimeSpec {
-    // The implementation of cmp is simplified by assuming that the struct is
-    // normalized.  That is, tv_nsec must always be within [0, 1_000_000_000)
-    fn eq(&self, other: &TimeSpec) -> bool {
-        self.tv_sec() == other.tv_sec() && self.tv_nsec() == other.tv_nsec()
-    }
-}
-
-impl Eq for TimeSpec {}
 
 impl Ord for TimeSpec {
     // The implementation of cmp is simplified by assuming that the struct is
@@ -105,10 +123,15 @@ impl PartialOrd for TimeSpec {
 
 impl TimeValLike for TimeSpec {
     #[inline]
+    #[cfg_attr(target_env = "musl", allow(deprecated))]
+    // https://github.com/rust-lang/libc/issues/1848
     fn seconds(seconds: i64) -> TimeSpec {
-        assert!(seconds >= TS_MIN_SECONDS && seconds <= TS_MAX_SECONDS,
+        assert!((TS_MIN_SECONDS..=TS_MAX_SECONDS).contains(&seconds),
                 "TimeSpec out of bounds; seconds={}", seconds);
-        TimeSpec(timespec {tv_sec: seconds as time_t, tv_nsec: 0 })
+        let mut ts = TIMESPEC_ZERO;
+        ts.tv_sec = seconds as time_t;
+        ts.tv_nsec = 0;
+        TimeSpec(ts)
     }
 
     #[inline]
@@ -130,14 +153,20 @@ impl TimeValLike for TimeSpec {
 
     /// Makes a new `TimeSpec` with given number of nanoseconds.
     #[inline]
+    #[cfg_attr(target_env = "musl", allow(deprecated))]
+    // https://github.com/rust-lang/libc/issues/1848
     fn nanoseconds(nanoseconds: i64) -> TimeSpec {
         let (secs, nanos) = div_mod_floor_64(nanoseconds, NANOS_PER_SEC);
-        assert!(secs >= TS_MIN_SECONDS && secs <= TS_MAX_SECONDS,
+        assert!((TS_MIN_SECONDS..=TS_MAX_SECONDS).contains(&secs),
                 "TimeSpec out of bounds");
-        TimeSpec(timespec {tv_sec: secs as time_t,
-                           tv_nsec: nanos as c_long })
+        let mut ts = TIMESPEC_ZERO;
+        ts.tv_sec = secs as time_t;
+        ts.tv_nsec = nanos as timespec_tv_nsec_t;
+        TimeSpec(ts)
     }
 
+    // The cast is not unnecessary on all platforms.
+    #[allow(clippy::unnecessary_cast)]
     fn num_seconds(&self) -> i64 {
         if self.tv_sec() < 0 && self.tv_nsec() > 0 {
             (self.tv_sec() + 1) as i64
@@ -151,9 +180,11 @@ impl TimeValLike for TimeSpec {
     }
 
     fn num_microseconds(&self) -> i64 {
-        self.num_nanoseconds() / 1_000_000_000
+        self.num_nanoseconds() / 1_000
     }
 
+    // The cast is not unnecessary on all platforms.
+    #[allow(clippy::unnecessary_cast)]
     fn num_nanoseconds(&self) -> i64 {
         let secs = self.num_seconds() * 1_000_000_000;
         let nsec = self.nanos_mod_sec();
@@ -162,20 +193,34 @@ impl TimeValLike for TimeSpec {
 }
 
 impl TimeSpec {
-    fn nanos_mod_sec(&self) -> c_long {
+    fn nanos_mod_sec(&self) -> timespec_tv_nsec_t {
         if self.tv_sec() < 0 && self.tv_nsec() > 0 {
-            self.tv_nsec() - NANOS_PER_SEC as c_long
+            self.tv_nsec() - NANOS_PER_SEC as timespec_tv_nsec_t
         } else {
             self.tv_nsec()
         }
     }
 
-    pub fn tv_sec(&self) -> time_t {
+    #[cfg_attr(target_env = "musl", allow(deprecated))] // https://github.com/rust-lang/libc/issues/1848
+    pub const fn tv_sec(&self) -> time_t {
         self.0.tv_sec
     }
 
-    pub fn tv_nsec(&self) -> c_long {
+    pub const fn tv_nsec(&self) -> timespec_tv_nsec_t {
         self.0.tv_nsec
+    }
+
+    #[cfg_attr(target_env = "musl", allow(deprecated))]
+    // https://github.com/rust-lang/libc/issues/1848
+    pub const fn from_duration(duration: Duration) -> Self {
+        let mut ts = TIMESPEC_ZERO;
+        ts.tv_sec = duration.as_secs() as time_t;
+        ts.tv_nsec = duration.subsec_nanos() as timespec_tv_nsec_t;
+        TimeSpec(ts)
+    }
+
+    pub const fn from_timespec(timespec: timespec) -> Self {
+        Self(timespec)
     }
 }
 
@@ -209,7 +254,7 @@ impl ops::Mul<i32> for TimeSpec {
     type Output = TimeSpec;
 
     fn mul(self, rhs: i32) -> TimeSpec {
-        let usec = self.num_nanoseconds().checked_mul(rhs as i64)
+        let usec = self.num_nanoseconds().checked_mul(i64::from(rhs))
             .expect("TimeSpec multiply out of bounds");
 
         TimeSpec::nanoseconds(usec)
@@ -220,7 +265,7 @@ impl ops::Div<i32> for TimeSpec {
     type Output = TimeSpec;
 
     fn div(self, rhs: i32) -> TimeSpec {
-        let usec = self.num_nanoseconds() / rhs as i64;
+        let usec = self.num_nanoseconds() / i64::from(rhs);
         TimeSpec::nanoseconds(usec)
     }
 }
@@ -235,20 +280,20 @@ impl fmt::Display for TimeSpec {
 
         let sec = abs.tv_sec();
 
-        try!(write!(f, "{}", sign));
+        write!(f, "{}", sign)?;
 
         if abs.tv_nsec() == 0 {
             if abs.tv_sec() == 1 {
-                try!(write!(f, "{} second", sec));
+                write!(f, "{} second", sec)?;
             } else {
-                try!(write!(f, "{} seconds", sec));
+                write!(f, "{} seconds", sec)?;
             }
         } else if abs.tv_nsec() % 1_000_000 == 0 {
-            try!(write!(f, "{}.{:03} seconds", sec, abs.tv_nsec() / 1_000_000));
+            write!(f, "{}.{:03} seconds", sec, abs.tv_nsec() / 1_000_000)?;
         } else if abs.tv_nsec() % 1_000 == 0 {
-            try!(write!(f, "{}.{:06} seconds", sec, abs.tv_nsec() / 1_000));
+            write!(f, "{}.{:06} seconds", sec, abs.tv_nsec() / 1_000)?;
         } else {
-            try!(write!(f, "{}.{:09} seconds", sec, abs.tv_nsec()));
+            write!(f, "{}.{:09} seconds", sec, abs.tv_nsec())?;
         }
 
         Ok(())
@@ -257,8 +302,8 @@ impl fmt::Display for TimeSpec {
 
 
 
-#[repr(C)]
-#[derive(Clone, Copy)]
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TimeVal(timeval);
 
 const MICROS_PER_SEC: i64 = 1_000_000;
@@ -277,24 +322,11 @@ impl AsRef<timeval> for TimeVal {
     }
 }
 
-impl fmt::Debug for TimeVal {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        fmt.debug_struct("TimeVal")
-            .field("tv_sec", &self.tv_sec())
-            .field("tv_usec", &self.tv_usec())
-            .finish()
+impl AsMut<timeval> for TimeVal {
+    fn as_mut(&mut self) -> &mut timeval {
+        &mut self.0
     }
 }
-
-impl PartialEq for TimeVal {
-    // The implementation of cmp is simplified by assuming that the struct is
-    // normalized.  That is, tv_usec must always be within [0, 1_000_000)
-    fn eq(&self, other: &TimeVal) -> bool {
-        self.tv_sec() == other.tv_sec() && self.tv_usec() == other.tv_usec()
-    }
-}
-
-impl Eq for TimeVal {}
 
 impl Ord for TimeVal {
     // The implementation of cmp is simplified by assuming that the struct is
@@ -317,8 +349,9 @@ impl PartialOrd for TimeVal {
 impl TimeValLike for TimeVal {
     #[inline]
     fn seconds(seconds: i64) -> TimeVal {
-        assert!(seconds >= TV_MIN_SECONDS && seconds <= TV_MAX_SECONDS,
+        assert!((TV_MIN_SECONDS..=TV_MAX_SECONDS).contains(&seconds),
                 "TimeVal out of bounds; seconds={}", seconds);
+        #[cfg_attr(target_env = "musl", allow(deprecated))] // https://github.com/rust-lang/libc/issues/1848
         TimeVal(timeval {tv_sec: seconds as time_t, tv_usec: 0 })
     }
 
@@ -334,8 +367,9 @@ impl TimeValLike for TimeVal {
     #[inline]
     fn microseconds(microseconds: i64) -> TimeVal {
         let (secs, micros) = div_mod_floor_64(microseconds, MICROS_PER_SEC);
-        assert!(secs >= TV_MIN_SECONDS && secs <= TV_MAX_SECONDS,
+        assert!((TV_MIN_SECONDS..=TV_MAX_SECONDS).contains(&secs),
                 "TimeVal out of bounds");
+        #[cfg_attr(target_env = "musl", allow(deprecated))] // https://github.com/rust-lang/libc/issues/1848
         TimeVal(timeval {tv_sec: secs as time_t,
                            tv_usec: micros as suseconds_t })
     }
@@ -346,12 +380,15 @@ impl TimeValLike for TimeVal {
     fn nanoseconds(nanoseconds: i64) -> TimeVal {
         let microseconds = nanoseconds / 1000;
         let (secs, micros) = div_mod_floor_64(microseconds, MICROS_PER_SEC);
-        assert!(secs >= TV_MIN_SECONDS && secs <= TV_MAX_SECONDS,
+        assert!((TV_MIN_SECONDS..=TV_MAX_SECONDS).contains(&secs),
                 "TimeVal out of bounds");
+        #[cfg_attr(target_env = "musl", allow(deprecated))] // https://github.com/rust-lang/libc/issues/1848
         TimeVal(timeval {tv_sec: secs as time_t,
                            tv_usec: micros as suseconds_t })
     }
 
+    // The cast is not unnecessary on all platforms.
+    #[allow(clippy::unnecessary_cast)]
     fn num_seconds(&self) -> i64 {
         if self.tv_sec() < 0 && self.tv_usec() > 0 {
             (self.tv_sec() + 1) as i64
@@ -364,6 +401,8 @@ impl TimeValLike for TimeVal {
         self.num_microseconds() / 1_000
     }
 
+    // The cast is not unnecessary on all platforms.
+    #[allow(clippy::unnecessary_cast)]
     fn num_microseconds(&self) -> i64 {
         let secs = self.num_seconds() * 1_000_000;
         let usec = self.micros_mod_sec();
@@ -384,11 +423,12 @@ impl TimeVal {
         }
     }
 
-    pub fn tv_sec(&self) -> time_t {
+    #[cfg_attr(target_env = "musl", allow(deprecated))] // https://github.com/rust-lang/libc/issues/1848
+    pub const fn tv_sec(&self) -> time_t {
         self.0.tv_sec
     }
 
-    pub fn tv_usec(&self) -> suseconds_t {
+    pub const fn tv_usec(&self) -> suseconds_t {
         self.0.tv_usec
     }
 }
@@ -423,7 +463,7 @@ impl ops::Mul<i32> for TimeVal {
     type Output = TimeVal;
 
     fn mul(self, rhs: i32) -> TimeVal {
-        let usec = self.num_microseconds().checked_mul(rhs as i64)
+        let usec = self.num_microseconds().checked_mul(i64::from(rhs))
             .expect("TimeVal multiply out of bounds");
 
         TimeVal::microseconds(usec)
@@ -434,7 +474,7 @@ impl ops::Div<i32> for TimeVal {
     type Output = TimeVal;
 
     fn div(self, rhs: i32) -> TimeVal {
-        let usec = self.num_microseconds() / rhs as i64;
+        let usec = self.num_microseconds() / i64::from(rhs);
         TimeVal::microseconds(usec)
     }
 }
@@ -449,21 +489,27 @@ impl fmt::Display for TimeVal {
 
         let sec = abs.tv_sec();
 
-        try!(write!(f, "{}", sign));
+        write!(f, "{}", sign)?;
 
         if abs.tv_usec() == 0 {
             if abs.tv_sec() == 1 {
-                try!(write!(f, "{} second", sec));
+                write!(f, "{} second", sec)?;
             } else {
-                try!(write!(f, "{} seconds", sec));
+                write!(f, "{} seconds", sec)?;
             }
         } else if abs.tv_usec() % 1000 == 0 {
-            try!(write!(f, "{}.{:03} seconds", sec, abs.tv_usec() / 1000));
+            write!(f, "{}.{:03} seconds", sec, abs.tv_usec() / 1000)?;
         } else {
-            try!(write!(f, "{}.{:06} seconds", sec, abs.tv_usec()));
+            write!(f, "{}.{:06} seconds", sec, abs.tv_usec())?;
         }
 
         Ok(())
+    }
+}
+
+impl From<timeval> for TimeVal {
+    fn from(tv: timeval) -> Self {
+        TimeVal(tv)
     }
 }
 
@@ -498,6 +544,7 @@ fn div_rem_64(this: i64, other: i64) -> (i64, i64) {
 #[cfg(test)]
 mod test {
     use super::{TimeSpec, TimeVal, TimeValLike};
+    use std::time::Duration;
 
     #[test]
     pub fn test_timespec() {
@@ -506,6 +553,15 @@ mod test {
                    TimeSpec::seconds(3));
         assert_eq!(TimeSpec::minutes(3) + TimeSpec::seconds(2),
                    TimeSpec::seconds(182));
+    }
+
+    #[test]
+    pub fn test_timespec_from() {
+        let duration = Duration::new(123, 123_456_789);
+        let timespec = TimeSpec::nanoseconds(123_123_456_789);
+
+        assert_eq!(TimeSpec::from(duration), timespec);
+        assert_eq!(Duration::from(timespec), duration);
     }
 
     #[test]
